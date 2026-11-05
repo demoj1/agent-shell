@@ -368,8 +368,20 @@ Returns ACP-ERROR, a copy without those lines, or nil if nothing is left."
           ((< secs 86400) (format "%d ч" (/ secs 3600)))
           (t (format "%d дн" (/ secs 86400))))))
 
+(defun agent-shell-claude-status--stored-summary ()
+  "The last summary kept on a response marker in the buffer, without a time."
+  (when-let* ((pos (previous-single-property-change
+                    (point-max) 'agent-shell-claude-status-summary))
+              (message (or (get-text-property pos 'agent-shell-claude-status-summary)
+                           (get-text-property (max (point-min) (1- pos))
+                                              'agent-shell-claude-status-summary))))
+    (cons nil message)))
+
 (defun agent-shell-claude-status-buffer-text ()
   "One line about what the current shell is doing or waiting for."
+  (unless agent-shell-claude-status--last-summary
+    (setq agent-shell-claude-status--last-summary
+          (agent-shell-claude-status--stored-summary)))
   (cond
    ((shell-maker-busy)
     (propertize (concat "⚙ " (or agent-shell-claude-status--task "работает"))
@@ -390,9 +402,9 @@ Returns ACP-ERROR, a copy without those lines, or nil if nothing is left."
                            ("completed" 'agent-shell-claude-status-face)
                            ("failed" 'agent-shell-claude-status-failed-face)
                            (_ 'agent-shell-claude-status-attention-face)))
-       (propertize (concat " · " (agent-shell-claude-status--ago
-                                  (car agent-shell-claude-status--last-summary)))
-                   'face 'shadow))))
+       (when-let* ((time (car agent-shell-claude-status--last-summary)))
+         (propertize (concat " · " (agent-shell-claude-status--ago time))
+                     'face 'shadow)))))
    (t "")))
 
 (eval-when-compile (require 'ibuf-macs))
