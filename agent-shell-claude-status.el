@@ -92,6 +92,9 @@
 
 (defvar-local agent-shell-claude-status--suggestion-overlay nil)
 
+(defvar-local agent-shell-claude-status--last-summary nil
+  "Last `post_turn_summary' message and its arrival time, as (TIME . MESSAGE).")
+
 (defun agent-shell-claude-status-session-meta ()
   "Return the `claudeCode' session meta entry asking for the raw frames."
   (cons 'emitRawSDKMessages (vconcat agent-shell-claude-status--raw-filters)))
@@ -305,6 +308,7 @@ text below a collapsed block is rendered."
   "Update the current buffer's status from raw system MESSAGE."
   (pcase (map-elt message 'subtype)
     ("post_turn_summary"
+     (setq agent-shell-claude-status--last-summary (cons (current-time) message))
      (agent-shell-claude-status--store-summary message)
      (add-hook 'agent-shell-chat-after-relabel-hook
                #'agent-shell-claude-status--render-summaries nil t)
@@ -355,6 +359,51 @@ Returns ACP-ERROR, a copy without those lines, or nil if nothing is left."
               ((string-blank-p (string-join kept "\n")) nil)
               (t (cons (cons 'message (string-join kept "\n"))
                        (map-delete (copy-alist acp-error) 'message))))))))
+
+(defun agent-shell-claude-status--ago (time)
+  "Short age of TIME: \"5 мин\", \"2 ч\"."
+  (let ((secs (floor (float-time (time-subtract (current-time) time)))))
+    (cond ((< secs 60) "сейчас")
+          ((< secs 3600) (format "%d мин" (/ secs 60)))
+          ((< secs 86400) (format "%d ч" (/ secs 3600)))
+          (t (format "%d дн" (/ secs 86400))))))
+
+(defun agent-shell-claude-status-buffer-text ()
+  "One line about what the current shell is doing or waiting for."
+  (cond
+   ((shell-maker-busy)
+    (propertize (concat "⚙ " (or agent-shell-claude-status--task "работает"))
+                'face 'agent-shell-claude-status-face))
+   (agent-shell-claude-status--checking
+    (propertize "🔍 проверка разрешения…" 'face 'agent-shell-claude-status-attention-face))
+   (agent-shell-claude-status--last-summary
+    (let* ((message (cdr agent-shell-claude-status--last-summary))
+           (category (map-elt message 'status_category))
+           (action (map-elt message 'needs_action))
+           (text (if (and (stringp action) (not (string-blank-p action)))
+                     action
+                   (or (map-elt message 'status_detail) category ""))))
+      (concat
+       (propertize (concat (pcase category ("completed" "✓") ("failed" "✗") (_ "⏸"))
+                           " " (replace-regexp-in-string "[\n\t ]+" " " (string-trim text)))
+                   'face (pcase category
+                           ("completed" 'agent-shell-claude-status-face)
+                           ("failed" 'agent-shell-claude-status-failed-face)
+                           (_ 'agent-shell-claude-status-attention-face)))
+       (propertize (concat " · " (agent-shell-claude-status--ago
+                                  (car agent-shell-claude-status--last-summary)))
+                   'face 'shadow))))
+   (t "")))
+
+(eval-when-compile (require 'ibuf-macs))
+(declare-function ibuffer-make-column-filename-and-process "ibuffer")
+
+(with-eval-after-load 'ibuffer
+  (define-ibuffer-column agent-status
+    (:name "Status / Filename")
+    (if (derived-mode-p 'agent-shell-mode)
+        (agent-shell-claude-status-buffer-text)
+      (ibuffer-make-column-filename-and-process buffer mark))))
 
 ;;;###autoload
 (defun agent-shell-reload-idle ()
