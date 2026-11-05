@@ -240,14 +240,11 @@ text below a collapsed block is rendered."
   (setq agent-shell-claude-status--suggestion-overlay nil))
 
 (defun agent-shell-claude-status--refresh-suggestion ()
-  "Show the predicted prompt in an empty idle input, drop it once input starts."
+  "Show the predicted prompt while the idle input is empty."
   (agent-shell-claude-status--hide-suggestion)
   (when-let* ((suggestion agent-shell-claude-status--suggestion)
               (start (agent-shell-claude-status--input-start)))
-    (cond
-     ((< start (point-max))
-      (setq agent-shell-claude-status--suggestion nil))
-     ((not (shell-maker-busy))
+    (when (and (= start (point-max)) (not (shell-maker-busy)))
       (let ((ov (make-overlay start start nil t nil)))
         (overlay-put ov 'after-string
                      (concat (propertize (substring suggestion 0 1)
@@ -255,13 +252,12 @@ text below a collapsed block is rendered."
                                          'cursor t)
                              (propertize (substring suggestion 1)
                                          'face 'agent-shell-claude-status-suggestion-face)))
-        (setq agent-shell-claude-status--suggestion-overlay ov))))))
+        (setq agent-shell-claude-status--suggestion-overlay ov)))))
 
 (defun agent-shell-claude-status-accept-suggestion ()
   "Insert the predicted next prompt into the input."
   (interactive)
   (when-let* ((suggestion agent-shell-claude-status--suggestion))
-    (setq agent-shell-claude-status--suggestion nil)
     (agent-shell-claude-status--hide-suggestion)
     (goto-char (point-max))
     (insert suggestion)))
