@@ -19,6 +19,10 @@
 
 (declare-function agent-shell--update-header-and-mode-line "agent-shell")
 (declare-function agent-shell-prompt-ranges "agent-shell")
+(declare-function shell-maker-busy "shell-maker")
+(declare-function agent-shell-reload "agent-shell")
+(declare-function agent-shell--active-requests-p "agent-shell")
+(declare-function agent-shell--state "agent-shell")
 
 (defgroup agent-shell-claude-status nil
   "Claude Code session status in agent-shell's header."
@@ -41,10 +45,23 @@
   "Face of a failed turn."
   :group 'agent-shell-claude-status)
 
-(defconst agent-shell-claude-status--subtypes
-  '("post_turn_summary" "task_summary" "permission_check_status" "bridge_state"
-    "session_state_changed")
-  "System subtypes requested raw from the adapter.")
+(defcustom agent-shell-claude-status-rate-limit-threshold 75
+  "Show the rate limit in the header from this percent of utilization."
+  :type 'integer
+  :group 'agent-shell-claude-status)
+
+(defface agent-shell-claude-status-suggestion-face
+  '((t :inherit (completion-preview shadow)))
+  "Face of the predicted next prompt."
+  :group 'agent-shell-claude-status)
+
+(defconst agent-shell-claude-status--raw-filters
+  (append (mapcar (lambda (subtype) `((type . "system") (subtype . ,subtype)))
+                  '("post_turn_summary" "task_summary" "permission_check_status"
+                    "bridge_state" "session_state_changed"))
+          '(((type . "rate_limit_event"))
+            ((type . "prompt_suggestion"))))
+  "SDK messages requested raw from the adapter.")
 
 ;; The adapter writes all its logs to stderr (stdout is the ACP channel), and
 ;; agent-shell shows any stderr as Notices.
@@ -67,11 +84,17 @@
 (defvar-local agent-shell-claude-status--bridge nil
   "Last `bridge_state' message of Remote Control.")
 
+(defvar agent-shell-claude-status--rate-limit nil
+  "Last `rate_limit_info'; global, the limit is the account's.")
+
+(defvar-local agent-shell-claude-status--suggestion nil
+  "Predicted next prompt, dropped once the user types or submits.")
+
+(defvar-local agent-shell-claude-status--suggestion-overlay nil)
+
 (defun agent-shell-claude-status-session-meta ()
   "Return the `claudeCode' session meta entry asking for the raw frames."
-  (cons 'emitRawSDKMessages
-        (vconcat (mapcar (lambda (subtype) `((type . "system") (subtype . ,subtype)))
-                         agent-shell-claude-status--subtypes))))
+  (cons 'emitRawSDKMessages (vconcat agent-shell-claude-status--raw-filters)))
 
 (defun agent-shell-claude-status--truncate (text)
   "TEXT on one line, cut to `agent-shell-claude-status-max-width'."
@@ -108,9 +131,43 @@
                                                   'agent-shell-claude-status-attention-face))
             (when agent-shell-claude-status--task
               (agent-shell-claude-status--segment "⚙" agent-shell-claude-status--task
-                                                  'agent-shell-claude-status-face))))))
+                                                  'agent-shell-claude-status-face))
+            (agent-shell-claude-status--rate-limit-segment)))))
     (when segments
       (string-join segments " "))))
+
+(defun agent-shell-claude-status--rate-limit-segment ()
+  "Header segment for the account's rate limit, nil while it is far."
+  (when-let* ((info agent-shell-claude-status--rate-limit))
+    (let* ((status (map-elt info 'status))
+           (utilization (map-elt info 'utilization))
+           (percent (and (numberp utilization) (round (* 100 utilization))))
+           (resets (map-elt info 'resetsAt))
+           (resets (and (numberp resets) (if (> resets 1e11) (/ resets 1000) resets)))
+           (reset-text
+            (when resets
+              (format-time-string
+               (if (equal (format-time-string "%F" resets) (format-time-string "%F"))
+                   "%H:%M" "%d.%m %H:%M")
+               resets)))
+           (rejected (equal status "rejected")))
+      (when (or rejected
+                (equal status "allowed_warning")
+                (and percent (>= percent agent-shell-claude-status-rate-limit-threshold)))
+        (propertize
+         (concat (if rejected "⛔ лимит" (concat "⚠ " (if percent (format "%d%%" percent) "лимит")))
+                 (when reset-text (concat " · сброс " reset-text)))
+         'face (if rejected 'agent-shell-claude-status-failed-face
+                 'agent-shell-claude-status-attention-face)
+         'help-echo (format "Rate limit: %s, %s" status
+                            (or (map-elt info 'rateLimitType) "?")))))))
+
+(defun agent-shell-claude-status--update-all-headers ()
+  "Redraw the header of every shell, for account-wide state."
+  (dolist (buffer (buffer-list))
+    (with-current-buffer buffer
+      (when (derived-mode-p 'agent-shell-mode)
+        (agent-shell--update-header-and-mode-line)))))
 
 (defun agent-shell-claude-status--summary-text (message)
   "Lines for `post_turn_summary' MESSAGE under the response it summarizes."
@@ -163,8 +220,89 @@ text below a collapsed block is rendered."
           (overlay-put ov 'after-string (agent-shell-claude-status--summary-text message))))
       (setq ranges (cdr ranges)))))
 
+(defun agent-shell-claude-status--input-start ()
+  "Start of the prompt input, or nil without a process."
+  (when-let* ((process (get-buffer-process (current-buffer))))
+    (marker-position (process-mark process))))
+
+(defun agent-shell-claude-status--suggestion-visible-p ()
+  "Non-nil when the predicted prompt is shown at point."
+  (and (overlayp agent-shell-claude-status--suggestion-overlay)
+       (overlay-buffer agent-shell-claude-status--suggestion-overlay)
+       (eq (point) (overlay-start agent-shell-claude-status--suggestion-overlay))))
+
+(defun agent-shell-claude-status--hide-suggestion ()
+  (when (overlayp agent-shell-claude-status--suggestion-overlay)
+    (delete-overlay agent-shell-claude-status--suggestion-overlay))
+  (setq agent-shell-claude-status--suggestion-overlay nil))
+
+(defun agent-shell-claude-status--refresh-suggestion ()
+  "Show the predicted prompt in an empty idle input, drop it once input starts."
+  (agent-shell-claude-status--hide-suggestion)
+  (when-let* ((suggestion agent-shell-claude-status--suggestion)
+              (start (agent-shell-claude-status--input-start)))
+    (cond
+     ((< start (point-max))
+      (setq agent-shell-claude-status--suggestion nil))
+     ((not (shell-maker-busy))
+      (let ((ov (make-overlay start start nil t nil)))
+        (overlay-put ov 'after-string
+                     (concat (propertize (substring suggestion 0 1)
+                                         'face 'agent-shell-claude-status-suggestion-face
+                                         'cursor t)
+                             (propertize (substring suggestion 1)
+                                         'face 'agent-shell-claude-status-suggestion-face)))
+        (setq agent-shell-claude-status--suggestion-overlay ov))))))
+
+(defun agent-shell-claude-status-accept-suggestion ()
+  "Insert the predicted next prompt into the input."
+  (interactive)
+  (when-let* ((suggestion agent-shell-claude-status--suggestion))
+    (setq agent-shell-claude-status--suggestion nil)
+    (agent-shell-claude-status--hide-suggestion)
+    (goto-char (point-max))
+    (insert suggestion)))
+
+(defvar agent-shell-claude-status-suggestion-mode-map
+  (let ((map (make-sparse-keymap))
+        (binding `(menu-item "" agent-shell-claude-status-accept-suggestion
+                             :filter ,(lambda (command)
+                                        (when (agent-shell-claude-status--suggestion-visible-p)
+                                          command)))))
+    (define-key map (kbd "TAB") binding)
+    (define-key map (kbd "<tab>") binding)
+    map)
+  "Tab accepts the predicted prompt while it is shown, else keeps its binding.")
+
+(define-minor-mode agent-shell-claude-status-suggestion-mode
+  "Show Claude Code's predicted next prompt in an empty input; Tab accepts it."
+  :lighter nil
+  (dolist (hook '(post-command-hook agent-shell-chat-after-relabel-hook))
+    (if agent-shell-claude-status-suggestion-mode
+        (add-hook hook #'agent-shell-claude-status--refresh-suggestion nil t)
+      (remove-hook hook #'agent-shell-claude-status--refresh-suggestion t)))
+  (unless agent-shell-claude-status-suggestion-mode
+    (agent-shell-claude-status--hide-suggestion)))
+
 (defun agent-shell-claude-status--apply (message)
   "Update the current buffer's status from raw SDK MESSAGE."
+  (pcase (map-elt message 'type)
+    ("rate_limit_event"
+     (setq agent-shell-claude-status--rate-limit (map-elt message 'rate_limit_info))
+     (agent-shell-claude-status--update-all-headers))
+    ("prompt_suggestion"
+     (let ((suggestion (map-elt message 'suggestion)))
+       ;; Busy here means the next prompt was sent before the prediction arrived.
+       (when (and (stringp suggestion) (not (string-blank-p suggestion))
+                  (not (shell-maker-busy)))
+         (setq agent-shell-claude-status--suggestion (string-trim suggestion))
+         (agent-shell-claude-status-suggestion-mode 1)
+         (agent-shell-claude-status--refresh-suggestion))))
+    ("system"
+     (agent-shell-claude-status--apply-system message))))
+
+(defun agent-shell-claude-status--apply-system (message)
+  "Update the current buffer's status from raw system MESSAGE."
   (pcase (map-elt message 'subtype)
     ("post_turn_summary"
      (agent-shell-claude-status--store-summary message)
@@ -184,8 +322,10 @@ text below a collapsed block is rendered."
     ("bridge_state"
      (setq agent-shell-claude-status--bridge message))
     ("session_state_changed"
-     (when (equal (map-elt message 'state) "idle")
-       (setq agent-shell-claude-status--checking nil))))
+     (pcase (map-elt message 'state)
+       ("idle" (setq agent-shell-claude-status--checking nil))
+       ("running" (setq agent-shell-claude-status--suggestion nil)
+        (agent-shell-claude-status--hide-suggestion)))))
   (agent-shell--update-header-and-mode-line))
 
 (defun agent-shell-claude-status-handle-notification (event)
@@ -215,6 +355,31 @@ Returns ACP-ERROR, a copy without those lines, or nil if nothing is left."
               ((string-blank-p (string-join kept "\n")) nil)
               (t (cons (cons 'message (string-join kept "\n"))
                        (map-delete (copy-alist acp-error) 'message))))))))
+
+;;;###autoload
+(defun agent-shell-reload-idle ()
+  "Reload every idle agent shell with its session ID; busy ones are skipped.
+Picks up new session meta, e.g. after updating agent-shell."
+  (interactive)
+  (let (reloaded skipped)
+    (save-selected-window
+      ;; `agent-shell-restart' displays a shell that is not on screen.
+      (cl-letf (((symbol-function 'agent-shell--display-buffer) #'ignore))
+        (dolist (buffer (buffer-list))
+          (when (and (buffer-live-p buffer)
+                     (with-current-buffer buffer (derived-mode-p 'agent-shell-mode)))
+            (let ((name (buffer-name buffer)))
+              (if (with-current-buffer buffer
+                    (agent-shell--active-requests-p (agent-shell--state)))
+                  (push name skipped)
+                (condition-case err
+                    (with-current-buffer buffer
+                      (agent-shell-reload)
+                      (push name reloaded))
+                  (error (push (format "%s (%s)" name (error-message-string err))
+                               skipped)))))))))
+    (message "Перезапущено: %d%s" (length reloaded)
+             (if skipped (format "; пропущены: %s" (string-join skipped ", ")) ""))))
 
 (provide 'agent-shell-claude-status)
 
