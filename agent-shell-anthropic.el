@@ -29,6 +29,7 @@
   (require 'cl-lib))
 (require 'shell-maker)
 (require 'acp)
+(require 'agent-shell-claude-status)
 
 (declare-function agent-shell--indent-string "agent-shell")
 (declare-function agent-shell-welcome-message "agent-shell")
@@ -154,11 +155,13 @@ Returns an agent configuration alist using `agent-shell-make-agent-config'."
    ;; streams signature-only thinking blocks with no visible text.  Request
    ;; "summarized" so thinking is shown.  This is orthogonal to the effort /
    ;; thought level, which the agent advertises as a config option.
-   :session-meta '((claudeCode
+   :session-meta `((claudeCode
                     . ((options
                         . ((thinking
                             . ((type . "adaptive")
-                               (display . "summarized"))))))))
+                               (display . "summarized")))))
+                       ,(agent-shell-claude-status-session-meta))))
+   :notification-handler #'agent-shell-claude-status-handle-notification
    :install-instructions "See https://github.com/agentclientprotocol/claude-agent-acp for installation."))
 
 (defun agent-shell-anthropic-start-claude-code ()

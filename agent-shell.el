@@ -8897,16 +8897,17 @@ The agent config's `:mcp-servers' take precedence over the global
   (acp-subscribe-to-errors
    :client (map-elt state :client)
    :on-error (lambda (acp-error)
-               (agent-shell--update-fragment
-                :state state
-                :block-id (format "%s-notices"
-                                  (map-elt state :request-count))
-                :label-left (propertize "Notices" 'font-lock-face 'agent-shell-section-heading)
-                :body (or (map-elt acp-error 'message)
-                          (map-elt acp-error 'data)
-                          "Something is up ¯\\_ (ツ)_/¯")
-                :append t
-                :above-last-prompt (not (shell-maker-busy)))))
+               (when-let* ((acp-error (agent-shell-claude-status-filter-error acp-error)))
+                 (agent-shell--update-fragment
+                  :state state
+                  :block-id (format "%s-notices"
+                                    (map-elt state :request-count))
+                  :label-left (propertize "Notices" 'font-lock-face 'agent-shell-section-heading)
+                  :body (or (map-elt acp-error 'message)
+                            (map-elt acp-error 'data)
+                            "Something is up ¯\\_ (ツ)_/¯")
+                  :append t
+                  :above-last-prompt (not (shell-maker-busy))))))
   (acp-subscribe-to-notifications
    :client (map-elt state :client)
    :on-notification (lambda (acp-notification)
