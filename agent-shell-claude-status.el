@@ -1,4 +1,4 @@
-;;; agent-shell-claude-status.el --- Claude Code session status in the mode line -*- lexical-binding: t; -*-
+;;; agent-shell-claude-status.el --- Claude Code session status in the header -*- lexical-binding: t; -*-
 
 ;;; Commentary:
 
@@ -6,7 +6,7 @@
 ;; `post_turn_summary', `task_summary', `permission_check_status' and
 ;; `bridge_state' frames to ACP and logs them as "Unexpected case" on stderr
 ;; instead (agentclientprotocol/claude-agent-acp#1532).  We ask for them raw
-;; via `_meta.claudeCode.emitRawSDKMessages', show them in the mode line and
+;; via `_meta.claudeCode.emitRawSDKMessages', show them in the header and
 ;; drop the stderr noise from Notices.
 
 ;;; Code:
@@ -16,12 +16,14 @@
 (require 'seq)
 (require 'subr-x)
 
+(declare-function agent-shell--update-header-and-mode-line "agent-shell")
+
 (defgroup agent-shell-claude-status nil
-  "Claude Code session status in agent-shell's mode line."
+  "Claude Code session status in agent-shell's header."
   :group 'agent-shell)
 
 (defcustom agent-shell-claude-status-max-width 60
-  "Maximum width of the status text in the mode line."
+  "Maximum width of each status text in the header."
   :type 'integer
   :group 'agent-shell-claude-status)
 
@@ -78,29 +80,32 @@
                             agent-shell-claude-status-max-width nil nil "…"))
 
 (defun agent-shell-claude-status--segment (icon text face)
-  "Mode line segment: ICON and TEXT in FACE, full TEXT in the tooltip."
-  (concat " " (propertize (concat icon " " (agent-shell-claude-status--truncate text))
-                          'face face 'help-echo text)))
+  "Status segment: ICON and TEXT in FACE, full TEXT in the tooltip."
+  (propertize (concat icon " " (agent-shell-claude-status--truncate text))
+              'face face 'help-echo text))
 
-(defun agent-shell-claude-status--mode-line ()
-  "Mode line text for the current shell buffer."
-  (let ((turn agent-shell-claude-status--turn)
-        (bridge agent-shell-claude-status--bridge))
-    (concat
-     (when bridge
-       (let ((state (map-elt bridge 'state))
-             (detail (map-elt bridge 'detail)))
-         (concat " " (propertize
-                      (pcase state
-                        ("connected" "📡")
-                        ("failed" "📡✗")
-                        (_ "📡…"))
-                      'face (if (equal state "failed")
-                                'agent-shell-claude-status-failed-face
-                              'agent-shell-claude-status-face)
-                      'help-echo (concat "Remote Control: " state
-                                         (when (stringp detail) (concat " — " detail)))))))
-     (when agent-shell-claude-status--checking
+(defun agent-shell-claude-status-header ()
+  "Status text for the current shell's header, or nil when there is none."
+  (let* ((turn agent-shell-claude-status--turn)
+         (bridge agent-shell-claude-status--bridge)
+         (segments
+          (delq
+           nil
+           (list
+            (when bridge
+              (let ((state (map-elt bridge 'state))
+                    (detail (map-elt bridge 'detail)))
+                (propertize
+                 (pcase state
+                   ("connected" "📡")
+                   ("failed" "📡✗")
+                   (_ "📡…"))
+                 'face (if (equal state "failed")
+                           'agent-shell-claude-status-failed-face
+                         'agent-shell-claude-status-face)
+                 'help-echo (concat "Remote Control: " state
+                                    (when (stringp detail) (concat " — " detail))))))
+            (when agent-shell-claude-status--checking
        (agent-shell-claude-status--segment "🔍" "проверка разрешения…"
                                            'agent-shell-claude-status-attention-face))
      (when (and agent-shell-claude-status--task (not turn))
@@ -117,10 +122,9 @@
                       "✗" detail 'agent-shell-claude-status-failed-face))
            (_ (agent-shell-claude-status--segment
                "⏸" (if (and (stringp action) (not (string-empty-p action))) action detail)
-               'agent-shell-claude-status-attention-face))))))))
-
-(defconst agent-shell-claude-status--mode-line-entry
-  '(:eval (agent-shell-claude-status--mode-line)))
+               'agent-shell-claude-status-attention-face)))))))))
+    (when segments
+      (string-join segments " "))))
 
 (defun agent-shell-claude-status--apply (message)
   "Update the current buffer's status from raw SDK MESSAGE."
@@ -143,10 +147,7 @@
      (pcase (map-elt message 'state)
        ("running" (setq agent-shell-claude-status--turn nil))
        ("idle" (setq agent-shell-claude-status--checking nil)))))
-  (unless (member agent-shell-claude-status--mode-line-entry mode-line-misc-info)
-    (setq-local mode-line-misc-info
-                (cons agent-shell-claude-status--mode-line-entry mode-line-misc-info)))
-  (force-mode-line-update))
+  (agent-shell--update-header-and-mode-line))
 
 (defun agent-shell-claude-status-handle-notification (event)
   "Handle `_claude/sdkMessage' from EVENT's `:acp-notification'.

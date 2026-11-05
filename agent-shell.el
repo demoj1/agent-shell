@@ -6744,6 +6744,7 @@ everything and clear the render cache."
                  (agent-shell--make-header-model
                   (agent-shell--state)
                   :width (agent-shell--header-width (current-buffer))
+                  :status (agent-shell-claude-status-header)
                   :menu-keys `((:model . ,(key-description (where-is-internal
                                                             'agent-shell-set-session-model
                                                             agent-shell-mode-map t)))
