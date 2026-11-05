@@ -3,11 +3,11 @@
 ;;; Commentary:
 
 ;; Fork-only (demoj1).  claude-agent-acp does not map the CLI's
-;; `post_turn_summary', `task_summary' and `permission_check_status' frames
-;; to ACP and logs them as "Unexpected case" on stderr instead
-;; (agentclientprotocol/claude-agent-acp#1532).  We ask for them raw via
-;; `_meta.claudeCode.emitRawSDKMessages', show them in the mode line and drop
-;; the stderr noise from Notices.
+;; `post_turn_summary', `task_summary', `permission_check_status' and
+;; `bridge_state' frames to ACP and logs them as "Unexpected case" on stderr
+;; instead (agentclientprotocol/claude-agent-acp#1532).  We ask for them raw
+;; via `_meta.claudeCode.emitRawSDKMessages', show them in the mode line and
+;; drop the stderr noise from Notices.
 
 ;;; Code:
 
@@ -38,12 +38,21 @@
   :group 'agent-shell-claude-status)
 
 (defconst agent-shell-claude-status--subtypes
-  '("post_turn_summary" "task_summary" "permission_check_status" "session_state_changed")
+  '("post_turn_summary" "task_summary" "permission_check_status" "bridge_state"
+    "session_state_changed")
   "System subtypes requested raw from the adapter.")
 
-(defconst agent-shell-claude-status--unhandled-subtypes
-  '("post_turn_summary" "task_summary" "permission_check_status")
-  "Subtypes the adapter logs as \"Unexpected case\".")
+;; The adapter writes all its logs to stderr (stdout is the ACP channel), and
+;; agent-shell shows any stderr as Notices.
+(defcustom agent-shell-claude-status-ignored-stderr-regexps
+  (list (concat "\\`[ \t]*Unexpected case: {\"type\":\"system\",\"subtype\":\""
+                (regexp-opt '("post_turn_summary" "task_summary"
+                              "permission_check_status" "bridge_state"))
+                "\"")
+        "\\`[ \t]*\\[idle-compaction\\] ")
+  "Adapter stderr lines not shown in Notices."
+  :type '(repeat regexp)
+  :group 'agent-shell-claude-status)
 
 (defvar-local agent-shell-claude-status--turn nil
   "Last `post_turn_summary' message, nil while a turn runs.")
@@ -53,6 +62,9 @@
 
 (defvar-local agent-shell-claude-status--checking nil
   "Tool use ids whose permission check is in progress.")
+
+(defvar-local agent-shell-claude-status--bridge nil
+  "Last `bridge_state' message of Remote Control.")
 
 (defun agent-shell-claude-status-session-meta ()
   "Return the `claudeCode' session meta entry asking for the raw frames."
@@ -72,8 +84,22 @@
 
 (defun agent-shell-claude-status--mode-line ()
   "Mode line text for the current shell buffer."
-  (let ((turn agent-shell-claude-status--turn))
+  (let ((turn agent-shell-claude-status--turn)
+        (bridge agent-shell-claude-status--bridge))
     (concat
+     (when bridge
+       (let ((state (map-elt bridge 'state))
+             (detail (map-elt bridge 'detail)))
+         (concat " " (propertize
+                      (pcase state
+                        ("connected" "📡")
+                        ("failed" "📡✗")
+                        (_ "📡…"))
+                      'face (if (equal state "failed")
+                                'agent-shell-claude-status-failed-face
+                              'agent-shell-claude-status-face)
+                      'help-echo (concat "Remote Control: " state
+                                         (when (stringp detail) (concat " — " detail)))))))
      (when agent-shell-claude-status--checking
        (agent-shell-claude-status--segment "🔍" "проверка разрешения…"
                                            'agent-shell-claude-status-attention-face))
@@ -111,6 +137,8 @@
              (if (equal (map-elt message 'status) "checking")
                  (cl-adjoin id agent-shell-claude-status--checking :test #'equal)
                (remove id agent-shell-claude-status--checking)))))
+    ("bridge_state"
+     (setq agent-shell-claude-status--bridge message))
     ("session_state_changed"
      (pcase (map-elt message 'state)
        ("running" (setq agent-shell-claude-status--turn nil))
@@ -133,16 +161,16 @@ Returns non-nil when handled, so agent-shell skips its default handling."
       t)))
 
 (defun agent-shell-claude-status-filter-error (acp-error)
-  "Drop the adapter's \"Unexpected case\" lines for frames shown here.
+  "Drop stderr lines matching `agent-shell-claude-status-ignored-stderr-regexps'.
 Returns ACP-ERROR, a copy without those lines, or nil if nothing is left."
   (let ((message (map-elt acp-error 'message)))
     (if (not (stringp message))
         acp-error
-      (let* ((noise (concat "\\`[ \t]*Unexpected case: {\"type\":\"system\",\"subtype\":\""
-                            (regexp-opt agent-shell-claude-status--unhandled-subtypes)
-                            "\""))
-             (lines (split-string message "\n"))
-             (kept (seq-remove (lambda (line) (string-match-p noise line)) lines)))
+      (let* ((lines (split-string message "\n"))
+             (kept (seq-remove (lambda (line)
+                                 (seq-some (lambda (re) (string-match-p re line))
+                                           agent-shell-claude-status-ignored-stderr-regexps))
+                               lines)))
         (cond ((= (length kept) (length lines)) acp-error)
               ((string-blank-p (string-join kept "\n")) nil)
               (t (cons (cons 'message (string-join kept "\n"))
