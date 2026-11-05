@@ -6,7 +6,8 @@
 ;; `post_turn_summary', `task_summary', `permission_check_status' and
 ;; `bridge_state' frames to ACP and logs them as "Unexpected case" on stderr
 ;; instead (agentclientprotocol/claude-agent-acp#1532).  We ask for them raw
-;; via `_meta.claudeCode.emitRawSDKMessages', show them in the header and
+;; via `_meta.claudeCode.emitRawSDKMessages', show the turn summary under its
+;; response and the rest in the header, and
 ;; drop the stderr noise from Notices.
 
 ;;; Code:
@@ -17,6 +18,7 @@
 (require 'subr-x)
 
 (declare-function agent-shell--update-header-and-mode-line "agent-shell")
+(declare-function agent-shell-prompt-ranges "agent-shell")
 
 (defgroup agent-shell-claude-status nil
   "Claude Code session status in agent-shell's header."
@@ -56,9 +58,6 @@
   :type '(repeat regexp)
   :group 'agent-shell-claude-status)
 
-(defvar-local agent-shell-claude-status--turn nil
-  "Last `post_turn_summary' message, nil while a turn runs.")
-
 (defvar-local agent-shell-claude-status--task nil
   "Current `task_summary' text.")
 
@@ -86,8 +85,7 @@
 
 (defun agent-shell-claude-status-header ()
   "Status text for the current shell's header, or nil when there is none."
-  (let* ((turn agent-shell-claude-status--turn)
-         (bridge agent-shell-claude-status--bridge)
+  (let* ((bridge agent-shell-claude-status--bridge)
          (segments
           (delq
            nil
@@ -106,31 +104,60 @@
                  'help-echo (concat "Remote Control: " state
                                     (when (stringp detail) (concat " — " detail))))))
             (when agent-shell-claude-status--checking
-       (agent-shell-claude-status--segment "🔍" "проверка разрешения…"
-                                           'agent-shell-claude-status-attention-face))
-     (when (and agent-shell-claude-status--task (not turn))
-       (agent-shell-claude-status--segment "⚙" agent-shell-claude-status--task
-                                           'agent-shell-claude-status-face))
-     (when turn
-       (let ((category (map-elt turn 'status_category))
-             (detail (or (map-elt turn 'status_detail) ""))
-             (action (map-elt turn 'needs_action)))
-         (pcase category
-           ("completed" (agent-shell-claude-status--segment
-                         "✓" detail 'agent-shell-claude-status-face))
-           ("failed" (agent-shell-claude-status--segment
-                      "✗" detail 'agent-shell-claude-status-failed-face))
-           (_ (agent-shell-claude-status--segment
-               "⏸" (if (and (stringp action) (not (string-empty-p action))) action detail)
-               'agent-shell-claude-status-attention-face)))))))))
+              (agent-shell-claude-status--segment "🔍" "проверка разрешения…"
+                                                  'agent-shell-claude-status-attention-face))
+            (when agent-shell-claude-status--task
+              (agent-shell-claude-status--segment "⚙" agent-shell-claude-status--task
+                                                  'agent-shell-claude-status-face))))))
     (when segments
       (string-join segments " "))))
+
+(defun agent-shell-claude-status--summary-text (message)
+  "Lines for `post_turn_summary' MESSAGE under the response it summarizes."
+  (let* ((category (map-elt message 'status_category))
+         (detail (map-elt message 'status_detail))
+         (action (map-elt message 'needs_action))
+         (face (pcase category
+                 ("completed" 'agent-shell-claude-status-face)
+                 ("failed" 'agent-shell-claude-status-failed-face)
+                 (_ 'agent-shell-claude-status-attention-face)))
+         (icon (pcase category ("completed" "✓") ("failed" "✗") (_ "⏸"))))
+    (concat "\n\n"
+            (propertize (concat "  ↳ " icon " " (string-trim (or detail category "")))
+                        'face face)
+            (when (and (stringp action) (not (string-blank-p action))
+                       (not (equal action detail)))
+              (propertize (concat "\n    ждёт: " (string-trim action))
+                          'face 'agent-shell-claude-status-attention-face)))))
+
+(defun agent-shell-claude-status--last-response-end ()
+  "End of the text of the last finished response, or nil.
+The response of the run before the last one: the last run is the live
+prompt when idle, or the running prompt when busy."
+  (when-let* ((ranges (agent-shell-prompt-ranges))
+              (last-range (car (last ranges)))
+              ((cdr ranges)))
+    (save-excursion
+      (goto-char (map-elt last-range :prompt-start))
+      (skip-chars-backward " \t\n")
+      (when (> (point) (point-min)) (point)))))
+
+(defun agent-shell-claude-status--show-summary (message)
+  "Show `post_turn_summary' MESSAGE after the last finished response."
+  (when-let* ((end (agent-shell-claude-status--last-response-end)))
+    (dolist (ov (overlays-at (1- end)))
+      (when (overlay-get ov 'agent-shell-claude-status-summary)
+        (delete-overlay ov)))
+    (let ((ov (make-overlay (1- end) end nil t nil)))
+      (overlay-put ov 'agent-shell-claude-status-summary t)
+      (overlay-put ov 'evaporate t)
+      (overlay-put ov 'after-string (agent-shell-claude-status--summary-text message)))))
 
 (defun agent-shell-claude-status--apply (message)
   "Update the current buffer's status from raw SDK MESSAGE."
   (pcase (map-elt message 'subtype)
     ("post_turn_summary"
-     (setq agent-shell-claude-status--turn message))
+     (agent-shell-claude-status--show-summary message))
     ("task_summary"
      (let ((detail (map-elt message 'detail)))
        (setq agent-shell-claude-status--task
@@ -144,9 +171,8 @@
     ("bridge_state"
      (setq agent-shell-claude-status--bridge message))
     ("session_state_changed"
-     (pcase (map-elt message 'state)
-       ("running" (setq agent-shell-claude-status--turn nil))
-       ("idle" (setq agent-shell-claude-status--checking nil)))))
+     (when (equal (map-elt message 'state) "idle")
+       (setq agent-shell-claude-status--checking nil))))
   (agent-shell--update-header-and-mode-line))
 
 (defun agent-shell-claude-status-handle-notification (event)
