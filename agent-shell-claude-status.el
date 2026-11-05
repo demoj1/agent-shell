@@ -45,6 +45,11 @@
   "Face of a failed turn."
   :group 'agent-shell-claude-status)
 
+(defcustom agent-shell-claude-status-ibuffer-width 70
+  "Maximum width of the ibuffer `agent-status' column for a shell."
+  :type 'integer
+  :group 'agent-shell-claude-status)
+
 (defcustom agent-shell-claude-status-rate-limit-threshold 75
   "Show the rate limit in the header from this percent of utilization."
   :type 'integer
@@ -410,7 +415,10 @@ Returns ACP-ERROR, a copy without those lines, or nil if nothing is left."
   (define-ibuffer-column agent-status
     (:name "Status / Filename")
     (if (derived-mode-p 'agent-shell-mode)
-        (agent-shell-claude-status-buffer-text)
+        (let ((text (agent-shell-claude-status-buffer-text)))
+          (propertize (truncate-string-to-width
+                       text agent-shell-claude-status-ibuffer-width nil nil "…")
+                      'help-echo (substring-no-properties text)))
       (ibuffer-make-column-filename-and-process buffer mark))))
 
 ;;;###autoload
