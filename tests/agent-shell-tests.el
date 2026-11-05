@@ -5016,8 +5016,9 @@ instead."
       (let ((agent-shell-show-session-id t))
         (let ((indicator (agent-shell--session-id-indicator)))
           (should indicator)
-          (should (equal (substring-no-properties indicator)
-                         "test-session-id")))))))
+          (should (equal (substring-no-properties indicator) "test-ses"))
+          (should (string-prefix-p "test-session-id"
+                                   (get-text-property 0 'help-echo indicator))))))))
 
 (ert-deftest agent-shell--session-id-indicator-no-session-test ()
   "Test `agent-shell--session-id-indicator' returns nil without active session."
@@ -5091,7 +5092,7 @@ instead."
         (let ((model (agent-shell--make-header-model agent-shell--state)))
           (should (assq :session-id model))
           (should (equal (substring-no-properties (map-elt model :session-id))
-                         "test-session-id"))))
+                         "test-ses"))))
       ;; Disabled
       (let ((agent-shell-show-session-id nil))
         (let ((model (agent-shell--make-header-model agent-shell--state)))
@@ -5118,13 +5119,13 @@ instead."
       (let ((agent-shell-header-style 'text)
             (agent-shell-show-session-id t))
         (let ((header (agent-shell--make-header agent-shell--state)))
-          (should (string-match-p "test-session-id"
+          (should (string-match-p "test-ses"
                                   (substring-no-properties header)))))
       ;; Disabled: session ID absent
       (let ((agent-shell-header-style 'text)
             (agent-shell-show-session-id nil))
         (let ((header (agent-shell--make-header agent-shell--state)))
-          (should-not (string-match-p "test-session-id"
+          (should-not (string-match-p "test-ses"
                                       (substring-no-properties header))))))))
 
 (ert-deftest agent-shell--make-header-graphical-status-fg-test ()

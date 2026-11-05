@@ -6118,7 +6118,18 @@ frame metrics, ...) is not rebuilt on every beat.")
   (when-let* ((agent-shell-show-session-id)
               (session-id (map-nested-elt (agent-shell--state) '(:session :id)))
               ((not (string-empty-p session-id))))
-    (propertize session-id 'font-lock-face 'agent-shell-session-id)))
+    (propertize (truncate-string-to-width session-id 8)
+                'font-lock-face 'agent-shell-session-id
+                'help-echo (concat session-id "\nmouse-1: copy")
+                'mouse-face 'mode-line-highlight
+                'local-map (let ((map (make-sparse-keymap))
+                                 (buffer (current-buffer)))
+                             (define-key map [header-line mouse-1]
+                                         (lambda ()
+                                           (interactive)
+                                           (with-current-buffer buffer
+                                             (agent-shell-copy-session-id))))
+                             map))))
 
 (defun agent-shell--face-foreground (face)
   "Return the foreground color for FACE, walking `:inherit' chains.
