@@ -130,34 +130,47 @@
               (propertize (concat "\n    ждёт: " (string-trim action))
                           'face 'agent-shell-claude-status-attention-face)))))
 
-(defun agent-shell-claude-status--last-response-end ()
-  "End of the text of the last finished response, or nil.
+(defun agent-shell-claude-status--store-summary (message)
+  "Keep `post_turn_summary' MESSAGE on the marker of the last finished response.
 The response of the run before the last one: the last run is the live
 prompt when idle, or the running prompt when busy."
   (when-let* ((ranges (agent-shell-prompt-ranges))
-              (last-range (car (last ranges)))
-              ((cdr ranges)))
-    (save-excursion
-      (goto-char (map-elt last-range :prompt-start))
-      (skip-chars-backward " \t\n")
-      (when (> (point) (point-min)) (point)))))
+              (range (car (last ranges 2)))
+              ((cdr ranges))
+              (marker (map-elt range :input-end))
+              ((< marker (point-max))))
+    (with-silent-modifications
+      (let ((inhibit-read-only t))
+        (put-text-property marker (1+ marker) 'agent-shell-claude-status-summary message)))))
 
-(defun agent-shell-claude-status--show-summary (message)
-  "Show `post_turn_summary' MESSAGE after the last finished response."
-  (when-let* ((end (agent-shell-claude-status--last-response-end)))
-    (dolist (ov (overlays-at (1- end)))
-      (when (overlay-get ov 'agent-shell-claude-status-summary)
-        (delete-overlay ov)))
-    (let ((ov (make-overlay (1- end) end nil t nil)))
-      (overlay-put ov 'agent-shell-claude-status-summary t)
-      (overlay-put ov 'evaporate t)
-      (overlay-put ov 'after-string (agent-shell-claude-status--summary-text message)))))
+(defun agent-shell-claude-status--render-summaries ()
+  "Draw each stored turn summary after the end of its response text.
+Redrawn after every relabel: the summary can arrive before the response
+text below a collapsed block is rendered."
+  (remove-overlays (point-min) (point-max) 'agent-shell-claude-status-summary t)
+  (let ((ranges (agent-shell-prompt-ranges)))
+    (while (cdr ranges)
+      (when-let* ((marker (map-elt (car ranges) :input-end))
+                  ((< marker (point-max)))
+                  (message (get-text-property marker 'agent-shell-claude-status-summary))
+                  (end (save-excursion
+                         (goto-char (map-elt (cadr ranges) :prompt-start))
+                         (skip-chars-backward " \t\n")
+                         (point)))
+                  ((> end marker)))
+        (let ((ov (make-overlay (1- end) end nil t nil)))
+          (overlay-put ov 'agent-shell-claude-status-summary t)
+          (overlay-put ov 'after-string (agent-shell-claude-status--summary-text message))))
+      (setq ranges (cdr ranges)))))
 
 (defun agent-shell-claude-status--apply (message)
   "Update the current buffer's status from raw SDK MESSAGE."
   (pcase (map-elt message 'subtype)
     ("post_turn_summary"
-     (agent-shell-claude-status--show-summary message))
+     (agent-shell-claude-status--store-summary message)
+     (add-hook 'agent-shell-chat-after-relabel-hook
+               #'agent-shell-claude-status--render-summaries nil t)
+     (agent-shell-claude-status--render-summaries))
     ("task_summary"
      (let ((detail (map-elt message 'detail)))
        (setq agent-shell-claude-status--task
