@@ -153,6 +153,9 @@ to the background); `:box' t adds a border in the foreground color."
 
 ;;; State
 
+(defvar agent-shell-chat-after-relabel-hook nil
+  "Hook run in a shell buffer after its `Me' and agent labels are redrawn.")
+
 (defvar-local agent-shell-chat--labeled nil
   "Non-nil once chat labels have been applied to this shell buffer.")
 
@@ -1097,7 +1100,8 @@ Scans the whole buffer; cheap in practice since it walks property
 changes and skips already-labeled runs, but could be scoped to the
 active turn if it ever shows on very long conversations."
   (agent-shell-chat--label-prompts)
-  (agent-shell-chat--label-responses))
+  (agent-shell-chat--label-responses)
+  (run-hooks 'agent-shell-chat-after-relabel-hook))
 
 (defun agent-shell-chat--relabel-all ()
   "Relabel every labeled shell buffer.
