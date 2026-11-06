@@ -56,7 +56,8 @@
   :group 'agent-shell-claude-status)
 
 (defface agent-shell-claude-status-suggestion-face
-  '((t :inherit (completion-preview shadow)))
+  ;; Not completion-preview: Emacs 31 remaps its background per buffer and leaks the remaps.
+  '((t :inherit shadow))
   "Face of the predicted next prompt."
   :group 'agent-shell-claude-status)
 
