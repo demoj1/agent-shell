@@ -1648,6 +1648,17 @@ When NO-DISPLAY is non-nil, don't display the shell buffer."
     shell-buffer))
 
 ;;;###autoload
+(defun agent-shell--refreshed-agent-config (config)
+  "Return the current config with CONFIG's identifier, else CONFIG.
+The stored config is a snapshot from shell start, so edits to the
+config makers since then would be lost on restart."
+  (or (and (map-elt config :identifier)
+           (seq-find (lambda (candidate)
+                  (equal (map-elt candidate :identifier)
+                         (map-elt config :identifier)))
+                     (agent-shell--resolved-agent-configs)))
+      config))
+
 (cl-defun agent-shell-restart (&key session-id)
   "Clear conversation by restarting the agent shell in the same project.
 
@@ -1670,8 +1681,9 @@ Works from both shell and viewport buffers."
                            'new-deferred)
                        'new-deferred
                      'new))
-         (config (map-elt (buffer-local-value 'agent-shell--state shell-buffer)
-                          :agent-config))
+         (config (agent-shell--refreshed-agent-config
+                  (map-elt (buffer-local-value 'agent-shell--state shell-buffer)
+                           :agent-config)))
          (shell-dir (buffer-local-value 'default-directory shell-buffer))
          (pending-directory-cleanup
           (buffer-local-value 'agent-shell--pending-directory-cleanup shell-buffer))
