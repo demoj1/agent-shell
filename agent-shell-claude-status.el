@@ -223,10 +223,37 @@ text below a collapsed block is rendered."
                          (skip-chars-backward " \t\n")
                          (point)))
                   ((> end marker)))
+        (when-let* ((start (agent-shell-claude-status--repeated-tail marker end message)))
+          (let ((hidden (make-overlay start end nil t nil)))
+            (overlay-put hidden 'agent-shell-claude-status-summary t)
+            (overlay-put hidden 'invisible t))
+          (setq end start))
         (let ((ov (make-overlay (1- end) end nil t nil)))
           (overlay-put ov 'agent-shell-claude-status-summary t)
           (overlay-put ov 'after-string (agent-shell-claude-status--summary-text message))))
       (setq ranges (cdr ranges)))))
+
+(defun agent-shell-claude-status--normalize (text)
+  "TEXT without markdown emphasis and with collapsed whitespace."
+  (string-trim
+   (replace-regexp-in-string
+    "[ \t\n]+" " " (replace-regexp-in-string "[*_`]" "" (or text "")))))
+
+(defun agent-shell-claude-status--repeated-tail (beg end message)
+  "Start of the last paragraph in BEG..END repeating MESSAGE's summary.
+Returns the end of the visible text before it, or nil when it differs."
+  (let ((summaries (delete "" (mapcar #'agent-shell-claude-status--normalize
+                                      (list (map-elt message 'status_detail)
+                                            (map-elt message 'needs_action))))))
+    (save-excursion
+      (goto-char end)
+      (let ((para (if (re-search-backward "\n[ \t]*\n" beg t) (match-end 0) beg)))
+        (when (member (agent-shell-claude-status--normalize
+                       (buffer-substring-no-properties para end))
+                      summaries)
+          (goto-char para)
+          (skip-chars-backward " \t\n" beg)
+          (when (> (point) beg) (point)))))))
 
 (defun agent-shell-claude-status--input-start ()
   "Start of the prompt input, or nil without a process."
