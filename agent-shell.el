@@ -1648,6 +1648,11 @@ When NO-DISPLAY is non-nil, don't display the shell buffer."
     shell-buffer))
 
 ;;;###autoload
+(defun agent-shell--sync-buffer-name-override ()
+  "Point shell-maker at the current name of this shell buffer."
+  (unless (equal shell-maker--buffer-name-override (buffer-name))
+    (setq-local shell-maker--buffer-name-override (buffer-name))))
+
 (defun agent-shell--refreshed-agent-config (config)
   "Return the current config with CONFIG's identifier, else CONFIG.
 The stored config is a snapshot from shell start, so edits to the
@@ -5312,6 +5317,8 @@ variable (see makunbound)"))
                 #'agent-shell--prompt-queue-confirm-kill-emacs)
       (add-hook 'change-major-mode-hook #'agent-shell--clean-up nil t)
       (add-hook 'window-configuration-change-hook #'agent-shell--resize-header nil t)
+      ;; shell-maker finds its buffer by name, so a plain `rename-buffer' would orphan it.
+      (add-hook 'buffer-list-update-hook #'agent-shell--sync-buffer-name-override nil t)
       (agent-shell-ui-mode +1)
       (add-hook 'agent-shell-ui-post-expand-fragment-at-point-hook
                 #'agent-shell--render-markdown nil t)
