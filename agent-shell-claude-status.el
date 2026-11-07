@@ -138,9 +138,6 @@
             (when agent-shell-claude-status--checking
               (agent-shell-claude-status--segment "🔍" "проверка разрешения…"
                                                   'agent-shell-claude-status-attention-face))
-            (when agent-shell-claude-status--task
-              (agent-shell-claude-status--segment "⚙" agent-shell-claude-status--task
-                                                  'agent-shell-claude-status-face))
             (agent-shell-claude-status--rate-limit-segment)))))
     (when segments
       (string-join segments " "))))
@@ -233,6 +230,47 @@ text below a collapsed block is rendered."
           (overlay-put ov 'agent-shell-claude-status-summary t)
           (overlay-put ov 'after-string (agent-shell-claude-status--summary-text message))))
       (setq ranges (cdr ranges)))))
+
+(defun agent-shell-claude-status--strip-task (string)
+  "STRING without the task suffix."
+  (let ((i 0) acc)
+    (while (< i (length string))
+      (let ((next (next-single-property-change i 'agent-shell-claude-status-task
+                                               string (length string))))
+        (unless (get-text-property i 'agent-shell-claude-status-task string)
+          (push (substring string i next) acc))
+        (setq i next)))
+    (apply #'concat (nreverse acc))))
+
+(defun agent-shell-claude-status--render-task ()
+  "Show the running task right-aligned on the label of the last response."
+  (let (last)
+    (dolist (ov (overlays-in (point-min) (point-max)))
+      (when (eq (overlay-get ov 'agent-shell-chat--tag) 'agent)
+        (dolist (property '(display before-string))
+          (let ((value (overlay-get ov property)))
+            (when (and (stringp value)
+                       (text-property-not-all 0 (length value)
+                                              'agent-shell-claude-status-task nil value))
+              (overlay-put ov property (agent-shell-claude-status--strip-task value)))))
+        (when (or (null last) (> (overlay-start ov) (overlay-start last)))
+          (setq last ov))))
+    (when (and last agent-shell-claude-status--task)
+      (let* ((text (concat "⚙ " agent-shell-claude-status--task))
+             (suffix (propertize
+                      (concat (propertize " " 'display
+                                          `(space :align-to (- right ,(1+ (string-width text)))))
+                              (propertize text 'face 'agent-shell-claude-status-face))
+                      'agent-shell-claude-status-task t)))
+        (dolist (property '(display before-string))
+          (let ((value (overlay-get last property)))
+            (when (and (stringp value) (string-match-p "[^ \t\n]" value))
+              ;; A label can start with blank lines; append to the name's row.
+              (let* ((name-start (string-match "[^ \t\n]" value))
+                     (nl (string-match "\n" value name-start)))
+                (overlay-put last property
+                             (if nl (concat (substring value 0 nl) suffix (substring value nl))
+                               (concat value suffix)))))))))))
 
 (defun agent-shell-claude-status--normalize (text)
   "TEXT without markdown emphasis and with collapsed whitespace."
@@ -345,7 +383,10 @@ Returns the end of the visible text before it, or nil when it differs."
     ("task_summary"
      (let ((detail (map-elt message 'detail)))
        (setq agent-shell-claude-status--task
-             (and (stringp detail) (not (string-empty-p detail)) detail))))
+             (and (stringp detail) (not (string-empty-p detail)) detail))
+       (add-hook 'agent-shell-chat-after-relabel-hook
+                 #'agent-shell-claude-status--render-task nil t)
+       (agent-shell-claude-status--render-task)))
     ("permission_check_status"
      (let ((id (map-elt message 'tool_use_id)))
        (setq agent-shell-claude-status--checking
@@ -356,7 +397,9 @@ Returns the end of the visible text before it, or nil when it differs."
      (setq agent-shell-claude-status--bridge message))
     ("session_state_changed"
      (pcase (map-elt message 'state)
-       ("idle" (setq agent-shell-claude-status--checking nil))
+       ("idle" (setq agent-shell-claude-status--checking nil
+                     agent-shell-claude-status--task nil)
+        (agent-shell-claude-status--render-task))
        ("running" (setq agent-shell-claude-status--suggestion nil)
         (agent-shell-claude-status--hide-suggestion)))))
   (agent-shell--update-header-and-mode-line))
