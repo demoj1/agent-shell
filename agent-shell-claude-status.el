@@ -253,14 +253,22 @@ text below a collapsed block is rendered."
                        (text-property-not-all 0 (length value)
                                               'agent-shell-claude-status-task nil value))
               (overlay-put ov property (agent-shell-claude-status--strip-task value)))))
-        (when (or (null last) (> (overlay-start ov) (overlay-start last)))
+        (when (and (seq-some (lambda (property)
+                               (let ((value (overlay-get ov property)))
+                                 (and (stringp value) (string-match-p "[^ \t\n]" value))))
+                             '(display before-string))
+                   (or (null last) (> (overlay-start ov) (overlay-start last))))
           (setq last ov))))
     (when (and last agent-shell-claude-status--task)
-      (let* ((text (concat "⚙ " agent-shell-claude-status--task))
+      (let* ((text (propertize (truncate-string-to-width
+                                (concat "⚙ " agent-shell-claude-status--task)
+                                agent-shell-claude-status-max-width nil nil "…")
+                               'face 'agent-shell-claude-status-face))
+             ;; Pixels, not columns: ⚙ and the label font make column widths wrap the line.
+             (width (+ (string-pixel-width text) (* 2 (frame-char-width))))
              (suffix (propertize
-                      (concat (propertize " " 'display
-                                          `(space :align-to (- right ,(1+ (string-width text)))))
-                              (propertize text 'face 'agent-shell-claude-status-face))
+                      (concat (propertize " " 'display `(space :align-to (- right (,width))))
+                              text)
                       'agent-shell-claude-status-task t)))
         (dolist (property '(display before-string))
           (let ((value (overlay-get last property)))
