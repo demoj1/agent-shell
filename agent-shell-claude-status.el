@@ -260,25 +260,40 @@ text below a collapsed block is rendered."
                    (or (null last) (> (overlay-start ov) (overlay-start last))))
           (setq last ov))))
     (when (and last agent-shell-claude-status--task)
-      (let* ((text (propertize (truncate-string-to-width
-                                (concat "⚙ " agent-shell-claude-status--task)
-                                agent-shell-claude-status-max-width nil nil "…")
-                               'face 'agent-shell-claude-status-face))
-             ;; Pixels, not columns: ⚙ and the label font make column widths wrap the line.
-             (width (+ (string-pixel-width text) (* 2 (frame-char-width))))
-             (suffix (propertize
-                      (concat (propertize " " 'display `(space :align-to (- right (,width))))
-                              text)
-                      'agent-shell-claude-status-task t)))
-        (dolist (property '(display before-string))
-          (let ((value (overlay-get last property)))
-            (when (and (stringp value) (string-match-p "[^ \t\n]" value))
-              ;; A label can start with blank lines; append to the name's row.
-              (let* ((name-start (string-match "[^ \t\n]" value))
-                     (nl (string-match "\n" value name-start)))
+      (dolist (property '(display before-string))
+        (let ((value (overlay-get last property)))
+          (when (and (stringp value) (string-match-p "[^ \t\n]" value))
+            ;; A label can start with blank lines; append to the name's row.
+            (let* ((name-start (string-match "[^ \t\n]" value))
+                   (nl (string-match "\n" value name-start))
+                   (row (substring value
+                                   (1+ (or (cl-position ?\n value :end name-start :from-end t) -1))
+                                   nl))
+                   (suffix (agent-shell-claude-status--task-suffix row)))
+              (when suffix
                 (overlay-put last property
                              (if nl (concat (substring value 0 nl) suffix (substring value nl))
                                (concat value suffix)))))))))))
+
+(defun agent-shell-claude-status--task-suffix (row)
+  "Right-aligned task text that fits after label ROW, or nil without room.
+Truncated on the right so the label and turn time never wrap."
+  (when-let* ((window (car (get-buffer-window-list nil nil t))))
+    (let* ((char (frame-char-width (window-frame window)))
+           ;; Margin for the relative time growing between relabels.
+           (room (- (window-body-width window t) (string-pixel-width row) (* 6 char)))
+           (icon (propertize "⚙ " 'face 'agent-shell-claude-status-face))
+           (columns (/ (- room (string-pixel-width icon)) char)))
+      (when (>= columns 8)
+        (let ((text (concat icon
+                            (propertize (truncate-string-to-width
+                                         agent-shell-claude-status--task columns nil nil "…")
+                                        'face 'agent-shell-claude-status-face))))
+          (propertize
+           (concat (propertize " " 'display
+                               `(space :align-to (- right (,(+ (string-pixel-width text) char)))))
+                   text)
+           'agent-shell-claude-status-task t 'agent-shell-label-right t))))))
 
 (defun agent-shell-claude-status--normalize (text)
   "TEXT without markdown emphasis and with collapsed whitespace."
@@ -392,7 +407,10 @@ Returns the end of the visible text before it, or nil when it differs."
      (let ((detail (map-elt message 'detail)))
        (setq agent-shell-claude-status--task
              (and (stringp detail) (not (string-empty-p detail)) detail))
+       ;; After turn-time, so the room left for the task accounts for the time.
        (add-hook 'agent-shell-chat-after-relabel-hook
+                 #'agent-shell-claude-status--render-task 90 t)
+       (add-hook 'window-configuration-change-hook
                  #'agent-shell-claude-status--render-task nil t)
        (agent-shell-claude-status--render-task)))
     ("permission_check_status"

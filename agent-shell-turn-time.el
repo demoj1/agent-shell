@@ -127,7 +127,11 @@
       (let* ((clean (agent-shell-turn-time--strip (overlay-get ov property)))
              ;; A label can start with blank lines; append to the name's row.
              (name-start (string-match "[^ \t\n]" clean))
-             (nl (and name-start (string-match "\n" clean name-start)))
+             (nl (and name-start
+                      ;; Right-aligned label tails (the running task) stay after the time.
+                      (or (text-property-any name-start (length clean)
+                                             'agent-shell-label-right t clean)
+                          (string-match "\n" clean name-start))))
              (suffix (propertize
                       (concat " " (agent-shell-turn-time--relfmt t0)
                               (when (numberp dur)
