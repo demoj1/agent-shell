@@ -86,7 +86,7 @@
                          (should (plist-get args :new-session))
                          (should (plist-get args :no-focus))
                          (get-buffer-create " *resumed-agent-test*"))))
-              (agent-shell-easysession--window-change (car windows))
+              (with-current-buffer pending (agent-shell-easysession-resume))
               (should (= calls 1))
               (dolist (window windows)
                 (should (equal (buffer-name (window-buffer window))
@@ -95,7 +95,6 @@
                 (should (equal shell-maker--buffer-name-override " *resume-agent-test*"))
                 (should-not (memq #'agent-shell-easysession--window-change
                                   window-buffer-change-functions)))
-              (agent-shell-easysession--window-change (car windows))
               (should (= calls 1)))))
       (dolist (name '(" *resume-agent-test*" " *resumed-agent-test*"))
         (when (get-buffer name) (kill-buffer name))))))
@@ -140,6 +139,96 @@
             (should (eq major-mode 'agent-shell-easysession-placeholder-mode))
             (should (equal agent-shell-easysession--data (map-elt item 'data)))))
       (when (get-buffer " *layout-agent-test*") (kill-buffer " *layout-agent-test*"))
+      (delete-directory directory t))))
+
+(defun agent-shell-easysession-test--shell ()
+  "Create an isolated shell with a saved session identifier."
+  (let ((buffer (generate-new-buffer " *unload-agent-test*")))
+    (with-current-buffer buffer
+      (setq major-mode 'agent-shell-mode)
+      (setq-local default-directory temporary-file-directory)
+      (setq-local agent-shell--state
+                  (agent-shell--make-state
+                   :buffer buffer :agent-config '((:identifier . claude-code))))
+      (map-put! agent-shell--state :session '((:id . "unload-123"))))
+    buffer))
+
+(ert-deftest agent-shell-easysession-unload-test ()
+  (let* ((agent-shell-agent-configs '(((:identifier . claude-code))))
+         (shell (agent-shell-easysession-test--shell))
+         (name (buffer-name shell))
+         (cleaned nil))
+    (unwind-protect
+        (save-window-excursion
+          (delete-other-windows)
+          (set-window-buffer (selected-window) shell)
+          (set-window-buffer (split-window-right) shell)
+          (with-current-buffer shell
+            (add-hook 'kill-buffer-hook (lambda () (setq cleaned t)) nil t)
+            (agent-shell-unload))
+          (should cleaned)
+          (should-not (buffer-live-p shell))
+          (with-current-buffer name
+            (should (eq major-mode 'agent-shell-easysession-placeholder-mode))
+            (should (equal default-directory temporary-file-directory))
+            (should (equal (agent-shell-easysession--save)
+                           '((session-id . "unload-123") (agent . claude-code))))
+            (should-not (local-variable-p 'window-buffer-change-functions))
+            (should (= 2 (length (get-buffer-window-list (current-buffer)))))
+            (cl-letf (((symbol-function 'agent-shell--start)
+                       (lambda (&rest args)
+                         (should (equal (plist-get args :session-id) "unload-123"))
+                         (get-buffer-create name))))
+              (call-interactively (key-binding (kbd "RET")))))
+          (should (= 2 (length (get-buffer-window-list (get-buffer name))))))
+      (when (get-buffer name) (kill-buffer name)))))
+
+(ert-deftest agent-shell-easysession-unload-refused-test ()
+  (let* ((agent-shell-agent-configs '(((:identifier . claude-code))))
+         (shell (agent-shell-easysession-test--shell)))
+    (unwind-protect
+        (with-current-buffer shell
+          (map-put! agent-shell--state :active-requests '((1 . "session/prompt")))
+          (should-error (agent-shell-unload) :type 'user-error)
+          (should (buffer-live-p shell))
+          (map-put! agent-shell--state :active-requests nil)
+          (map-put! agent-shell--state :session nil)
+          (should-error (agent-shell-unload) :type 'user-error)
+          (should (buffer-live-p shell))
+          (map-put! agent-shell--state :session '((:id . "unload-123")))
+          (setq-local agent-shell--pending-directory-cleanup "/tmp/keep-unload-test")
+          (let ((kill-buffer-query-functions (list (lambda () nil))))
+            (should-error (agent-shell-unload) :type 'user-error))
+          (should (buffer-live-p shell))
+          (should (equal agent-shell--pending-directory-cleanup "/tmp/keep-unload-test")))
+      (when (buffer-live-p shell) (kill-buffer shell)))))
+
+(ert-deftest agent-shell-easysession-unload-directory-test ()
+  (let* ((agent-shell-agent-configs '(((:identifier . claude-code))))
+         (directory (make-temp-file "agent-shell-unload-" t))
+         (shell (agent-shell-easysession-test--shell))
+         (name (buffer-name shell)))
+    (unwind-protect
+        (progn
+          (with-current-buffer shell
+            (setq-local agent-shell--pending-directory-cleanup directory)
+            (add-hook 'kill-buffer-hook
+                      (lambda ()
+                        (when agent-shell--pending-directory-cleanup
+                          (delete-directory agent-shell--pending-directory-cleanup t)))
+                      nil t)
+            (agent-shell-unload))
+          (should (file-directory-p directory))
+          (with-current-buffer name
+            (should (equal (map-elt (agent-shell-easysession--save)
+                                   'pending-directory-cleanup)
+                           directory))
+            (cl-letf (((symbol-function 'agent-shell--start)
+                       (lambda (&rest _) (get-buffer-create name))))
+              (agent-shell-easysession-resume)))
+          (with-current-buffer name
+            (should (equal agent-shell--pending-directory-cleanup directory))))
+      (when (get-buffer name) (kill-buffer name))
       (delete-directory directory t))))
 
 (provide 'agent-shell-easysession-tests)
