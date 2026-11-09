@@ -1628,6 +1628,36 @@ straight to the shell."
                                                 (after . "Test")))))
                  '(((:old . "") (:new . "Test") (:file . "/tmp/test.txt"))))))
 
+(ert-deftest agent-shell--make-diff-infos-multi-hunk-test ()
+  "Test a multi-hunk rawInput diff yields one diff info per hunk.
+Based on Copilot traffic from
+https://github.com/xenodium/agent-shell/issues/931."
+  (should (equal (agent-shell--make-diff-infos
+                  :acp-tool-call
+                  '((rawInput . ((fileName . "/home/ivan/code/flakes/flake.nix")
+                                 (diff . "diff --git a/flake.nix b/flake.nix
+index 0000000..0000000 100644
+--- a/flake.nix
++++ b/flake.nix
+@@ -29,4 +29,3 @@
+     };
+\s
+-    plasma-manager = {};
+     emacs-overlay = {
+@@ -179,3 +171,2 @@
+               sharedNixSettings
+-              inputs.plasma-manager.homeModules.plasma-manager
+               ./hosts/home.nix
+")))))
+                 '(((:old . "    };\n\n    plasma-manager = {};\n    emacs-overlay = {\n")
+                    (:new . "    };\n\n    emacs-overlay = {\n")
+                    (:file . "/home/ivan/code/flakes/flake.nix")
+                    (:line . 29))
+                   ((:old . "              sharedNixSettings\n              inputs.plasma-manager.homeModules.plasma-manager\n              ./hosts/home.nix\n")
+                    (:new . "              sharedNixSettings\n              ./hosts/home.nix\n")
+                    (:file . "/home/ivan/code/flakes/flake.nix")
+                    (:line . 179))))))
+
 (ert-deftest agent-shell--diffs-line-stats-test ()
   "Test `agent-shell--diffs-line-stats' aggregates across diffs."
   ;; Test nil input
@@ -8180,6 +8210,127 @@ user's own typing rather than a delete and re-insert."
             :busy t)
            '(:handed-on "send me" :cleared t))))
 
+(cl-defun agent-shell-tests--reroute-last-queued (&key confirm send-error (input "")
+                                                       (steering t)
+                                                       (default #'agent-shell-busy-submit-queue)
+                                                       (override #'agent-shell-busy-submit-steer)
+                                                       (reroute #'agent-shell-busy-submit-reroute-queue-to-steer))
+  "Queue two prompts, then \\[agent-shell-submit-override] with INPUT typed.
+
+CONFIRM answers the question asked, SEND-ERROR makes sending the steer
+signal, and STEERING is whether the agent supports it.  DEFAULT,
+OVERRIDE and REROUTE stand in for `agent-shell-busy-submit-default-function',
+`agent-shell-busy-submit-override-function' and
+`agent-shell-busy-submit-reroute-function' when pressing it, so the two
+prompts are queued either way.
+
+Returns what was asked, steered and left pending, and whether it
+signalled."
+  (agent-shell-tests--with-persistent-prompt-shell
+   (lambda ()
+     (let (asked steered signalled)
+       (insert "just the filenames")
+       (agent-shell-submit)
+       (insert "sorted by size")
+       (agent-shell-submit)
+       (insert input)
+       (cl-letf (((symbol-function 'agent-shell-steering-supported-p)
+                  (lambda (&rest _) steering))
+                 ((symbol-function 'y-or-n-p)
+                  (lambda (question) (setq asked question) confirm))
+                 ((symbol-function 'agent-shell-experimental--send-steering)
+                  (lambda (&rest args)
+                    (when send-error
+                      (error "Send failed"))
+                    (setq steered (plist-get args :prompt)))))
+         (condition-case nil
+             (let ((agent-shell-busy-submit-default-function default)
+                   (agent-shell-busy-submit-override-function override)
+                   (agent-shell-busy-submit-reroute-function reroute))
+               (agent-shell-submit-override))
+           (error (setq signalled t))))
+       (list :asked asked
+             :steered steered
+             :pending (map-elt agent-shell--state :pending-prompts)
+             :signalled signalled)))
+   :busy t))
+
+(ert-deftest agent-shell-submit-override-reroutes-last-queued-test ()
+  "An empty \\[agent-shell-submit-override] mid-turn steers the last queued prompt."
+  (should (equal (agent-shell-tests--reroute-last-queued :confirm t)
+                 '(:asked "Steer \"sorted by size\" instead?"
+                   :steered "sorted by size"
+                   :pending ("just the filenames")
+                   :signalled nil)))
+  ;; Whitespace alone counts as an empty prompt.
+  (should (equal (agent-shell-tests--reroute-last-queued :confirm t :input "  \n  ")
+                 '(:asked "Steer \"sorted by size\" instead?"
+                   :steered "sorted by size"
+                   :pending ("just the filenames")
+                   :signalled nil)))
+  ;; Declining leaves the queue as it was.
+  (should (equal (agent-shell-tests--reroute-last-queued :confirm nil)
+                 '(:asked "Steer \"sorted by size\" instead?"
+                   :steered nil
+                   :pending ("just the filenames" "sorted by size")
+                   :signalled t)))
+  ;; A steer that fails to send puts the prompt back.
+  (should (equal (agent-shell-tests--reroute-last-queued :confirm t :send-error t)
+                 '(:asked "Steer \"sorted by size\" instead?"
+                   :steered nil
+                   :pending ("just the filenames" "sorted by size")
+                   :signalled t)))
+  ;; An agent that cannot steer is refused before asking, rather than
+  ;; having `agent-shell-busy-submit-steer' queue the prompt right back.
+  (should (equal (agent-shell-tests--reroute-last-queued :confirm t :steering nil)
+                 '(:asked nil
+                   :steered nil
+                   :pending ("just the filenames" "sorted by size")
+                   :signalled t)))
+  ;; Rerouting is disabled when there is no reroute function.
+  (should (equal (agent-shell-tests--reroute-last-queued :confirm t :reroute nil)
+                 '(:asked nil
+                   :steered nil
+                   :pending ("just the filenames" "sorted by size")
+                   :signalled nil))))
+
+(ert-deftest agent-shell-busy-submit-reroute-queue-to-steer-other-pairs-test ()
+  "The built-in reroute declines any pair of functions other than queue and steer.
+
+Taking a submission back depends on how it was submitted, which is
+unknown for any other pair, so these are left for a reroute function
+written for them."
+  (dolist (pair `((,#'agent-shell-busy-submit-queue . ,#'agent-shell-busy-submit-queue)
+                  (,#'agent-shell-busy-submit-steer . ,#'agent-shell-busy-submit-steer)
+                  (,#'agent-shell-busy-submit-steer . ,#'agent-shell-busy-submit-queue)
+                  (,#'agent-shell-busy-submit-queue . ,(lambda (_prompt) nil))))
+    (should (equal (agent-shell-tests--reroute-last-queued
+                    :confirm t :default (car pair) :override (cdr pair))
+                   '(:asked nil
+                     :steered nil
+                     :pending ("just the filenames" "sorted by size")
+                     :signalled nil)))))
+
+(ert-deftest agent-shell-prompt-queue-rejects-blank-test ()
+  "Blank prompts are refused rather than queued or submitted."
+  (with-temp-buffer
+    (setq major-mode 'agent-shell-mode)
+    (setq-local agent-shell--state (agent-shell--make-state :buffer (current-buffer)))
+    (let (submitted)
+      (cl-letf (((symbol-function 'agent-shell--shell-buffer)
+                 (lambda (&rest _) (current-buffer)))
+                ((symbol-function 'agent-shell--insert-to-shell-buffer)
+                 (lambda (&rest _) (setq submitted t)))
+                ((symbol-function 'agent-shell--prompt-queue-echo) #'ignore))
+        (should-error (agent-shell--prompt-queue-enqueue :prompt "  \n  ")
+                      :type 'user-error)
+        (cl-letf (((symbol-function 'shell-maker-busy) (lambda (&rest _) t)))
+          (should-error (agent-shell-prompt-queue "\n\n") :type 'user-error))
+        (cl-letf (((symbol-function 'shell-maker-busy) (lambda (&rest _) nil)))
+          (should-error (agent-shell-prompt-queue "") :type 'user-error))
+        (should-not submitted)
+        (should-not (map-elt agent-shell--state :pending-prompts))))))
+
 (ert-deftest agent-shell--live-input-prompt-p-zero-length-test ()
   "A collapsed prompt span is not a prompt.
 
@@ -8640,8 +8791,11 @@ belongs to `agent-shell-markdown-rerender-tables' /
 `agent-shell-markdown-rerender-images', so this hook must not gate on
 the window width being unchanged."
   (with-temp-buffer
-    (let ((scheduled 0))
+    (agent-shell--enable-realign)
+    (let ((scheduled 0)
+          (shell-buffer (current-buffer)))
       (cl-letf (((symbol-function 'window-live-p) (lambda (_) t))
+                ((symbol-function 'window-buffer) (lambda (_) shell-buffer))
                 ((symbol-function 'window-body-width) (lambda (&rest _) 800))
                 ((symbol-function 'run-with-idle-timer)
                  (lambda (&rest _) (setq scheduled (1+ scheduled)) 'timer)))
@@ -8651,6 +8805,46 @@ the window width being unchanged."
         ;; stale, so this must still schedule.
         (agent-shell--realign-on-change 'window)
         (should (= scheduled 2))))))
+
+(ert-deftest agent-shell--realign-on-change-targets-window-buffer ()
+  "Schedule the re-align for the window's buffer, not the current one.
+Regression (#934): before Emacs 31, buffer-local window change hooks
+run with whatever buffer redisplay had current, so a shell window
+resized while another window was selected scheduled the re-render
+for the selected window's buffer instead."
+  (let ((shell-buffer (generate-new-buffer "*realign-shell*"))
+        (other-buffer (generate-new-buffer "*realign-other*"))
+        (scheduled-for nil))
+    (unwind-protect
+        (progn
+          (with-current-buffer shell-buffer
+            (agent-shell--enable-realign))
+          (cl-letf (((symbol-function 'window-live-p) (lambda (_) t))
+                    ((symbol-function 'run-with-idle-timer)
+                     (lambda (_secs _repeat _fn buffer)
+                       (push buffer scheduled-for)
+                       'timer)))
+            ;; Shell window resized while another buffer is current.
+            (cl-letf (((symbol-function 'window-buffer)
+                       (lambda (_) shell-buffer)))
+              (with-current-buffer other-buffer
+                (agent-shell--realign-on-change 'window)))
+            (should (equal scheduled-for (list shell-buffer)))
+            (should (eq (buffer-local-value 'agent-shell--realign-timer
+                                            shell-buffer)
+                        'timer))
+            (should-not (buffer-local-value 'agent-shell--realign-timer
+                                            other-buffer))
+            ;; Emacs 31 also runs the buffer-change hook for the shell
+            ;; buffer when it leaves a window now showing another buffer.
+            (setq scheduled-for nil)
+            (cl-letf (((symbol-function 'window-buffer)
+                       (lambda (_) other-buffer)))
+              (with-current-buffer shell-buffer
+                (agent-shell--realign-on-change 'window)))
+            (should-not scheduled-for)))
+      (kill-buffer shell-buffer)
+      (kill-buffer other-buffer))))
 
 (ert-deftest agent-shell--make-permission-actions-orders-allow-before-reject ()
   "Offer allowing before rejecting, whatever order the agent sent.
@@ -9032,6 +9226,20 @@ would ever render it."
                                      (buffer-substring-no-properties
                                       (point-min) (point-max))))))
       (delete-file image-file))))
+
+(ert-deftest agent-shell--render-deferred-markup-skips-rendered-list-lookalike-test ()
+  "A body ending in rendered markup that reads like a list item is left alone.
+
+It would otherwise be re-rendered at the end of every later turn."
+  (with-temp-buffer
+    (insert "Intro\n\n**1. Step**")
+    (put-text-property (point-min) (point-max) 'agent-shell-ui-section 'body)
+    (agent-shell--render-markdown)
+    (let ((rendered nil))
+      (cl-letf (((symbol-function 'agent-shell--render-markdown)
+                 (lambda (&rest _) (setq rendered t))))
+        (agent-shell--render-deferred-markup))
+      (should-not rendered))))
 
 (ert-deftest agent-shell--render-deferred-markup-resets-undo-history-test ()
   "Undo after a turn ending in a table undoes what was typed at the prompt.

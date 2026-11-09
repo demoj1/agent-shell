@@ -1193,6 +1193,82 @@ reference tests use would not catch a resolution gone wrong."
                             (match-beginning 0))))))
       (delete-directory directory t))))
 
+(ert-deftest agent-shell-markdown-open-link-at-point-test ()
+  "Test `agent-shell-markdown-open-link-at-point' opens a citation.
+
+It lands on the cited line and column, and `xref-go-back' returns to
+the citation, as after any other jump."
+  (let* ((directory (make-temp-file "agent-shell-refs" t))
+         (default-directory (file-name-as-directory directory))
+         (file (expand-file-name "foo.el"))
+         (origin (generate-new-buffer "*agent-shell-origin*")))
+    (unwind-protect
+        (with-selected-window (frame-first-window)
+          (save-window-excursion
+            (with-temp-file file (insert "one\ntwo\nthree\n"))
+            (switch-to-buffer origin)
+            (insert "see foo.el:3:2 here")
+            (agent-shell-markdown-replace-markup :complete t)
+            (goto-char 7)
+            (call-interactively #'agent-shell-markdown-open-link-at-point)
+            (should (equal (file-truename file)
+                           (file-truename (or (buffer-file-name) ""))))
+            (should (= 3 (line-number-at-pos)))
+            (should (= 1 (current-column)))
+            (xref-go-back)
+            (should (eq origin (current-buffer)))
+            (should (= 7 (point)))))
+      (kill-buffer origin)
+      (when (find-buffer-visiting file)
+        (kill-buffer (find-buffer-visiting file)))
+      (delete-directory directory t))))
+
+(ert-deftest agent-shell-markdown-xref-find-definitions-test ()
+  "Test \\[xref-find-definitions] on a citation visits it.
+
+Through `agent-shell-markdown-xref-backend', landing on the cited line
+and column, with `xref-go-back' returning to the citation."
+  (let* ((directory (make-temp-file "agent-shell-refs" t))
+         (default-directory (file-name-as-directory directory))
+         (file (expand-file-name "foo.el"))
+         (origin (generate-new-buffer "*agent-shell-origin*")))
+    (unwind-protect
+        (with-selected-window (frame-first-window)
+          (save-window-excursion
+            (with-temp-file file (insert "one\ntwo\nthree\n"))
+            (switch-to-buffer origin)
+            (add-hook 'xref-backend-functions
+                      #'agent-shell-markdown-xref-backend nil t)
+            (insert "see foo.el:3:2 here")
+            (agent-shell-markdown-replace-markup :complete t)
+            (goto-char 7)
+            (should (eq 'agent-shell-markdown (xref-find-backend)))
+            (xref-find-definitions (xref-backend-identifier-at-point
+                                    (xref-find-backend)))
+            (should (equal (file-truename file)
+                           (file-truename (or (buffer-file-name) ""))))
+            (should (= 3 (line-number-at-pos)))
+            (should (= 1 (current-column)))
+            (xref-go-back)
+            (should (eq origin (current-buffer)))
+            (should (= 7 (point)))))
+      (kill-buffer origin)
+      (when (find-buffer-visiting file)
+        (kill-buffer (find-buffer-visiting file)))
+      (delete-directory directory t))))
+
+(ert-deftest agent-shell-markdown-xref-backend-steps-aside-test ()
+  "Test `agent-shell-markdown-xref-backend' is nil off a local file link.
+That leaves \\[xref-find-definitions] to the next backend."
+  (with-temp-buffer
+    (insert (agent-shell-markdown-convert "see [docs](https://example.com) here"))
+    (goto-char (point-min))
+    (should-not (agent-shell-markdown-xref-backend))
+    (search-forward "docs")
+    (goto-char (match-beginning 0))
+    (should (agent-shell-markdown-link-url-at-point))
+    (should-not (agent-shell-markdown-xref-backend))))
+
 (ert-deftest agent-shell-markdown-linkify-file-reference-forms ()
   ;; The forms agents write: a line, a range, a line and column, and
   ;; GitHub's anchor.
@@ -2110,6 +2186,34 @@ print(\"hi\")
 
 "))))
 
+(ert-deftest agent-shell-markdown-replace-markup-streamed-nested-fences ()
+  ;; Streaming the same nested markdown must render it like the whole
+  ;; text does.  While the outer 4-backtick fence is still open, the
+  ;; complete inner ```elisp block must not render as its own panel,
+  ;; nor may inline markup after it.
+  (with-temp-buffer
+    (insert "````markdown\nSee `x`.\n\n```elisp\n(setq a 1)\n```\n")
+    (agent-shell-markdown-replace-markup)
+    (should-not (string-match-p "⧉" (buffer-string)))
+    (insert "\nIt's **bold**.\n")
+    (agent-shell-markdown-replace-markup)
+    (should-not (string-match-p "⧉" (buffer-string)))
+    (insert "````\n")
+    (agent-shell-markdown-replace-markup)
+    (should (equal (substring-no-properties (buffer-string))
+                   "
+markdown ⧉
+
+See `x`.
+
+```elisp
+(setq a 1)
+```
+
+It's **bold**.
+
+"))))
+
 (ert-deftest agent-shell-markdown-convert-source-block-with-language ()
   ;; `emacs-lisp' source block: fences deleted, an "emacs-lisp ⧉"
   ;; header is inserted as buffer text bracketed by tinted vpad
@@ -2641,16 +2745,174 @@ Outro"))))
                            (agent-shell-markdown-replace-markup)
                            (substring-no-properties (buffer-string))))))))))
 
-(ert-deftest agent-shell-markdown-list-joins-bold-numbered-items ()
-  ;; Bold-prefixed points like `**1. X**' become ordered list items once
-  ;; the bold markup is stripped, so a blank line the author left between
-  ;; them is joined too, and sub-bullets written tight stay tight.
+(defun agent-shell-markdown-tests--render-all-ways (markdown)
+  "Return MARKDOWN rendered in one go and streamed in chunks of 1, 3 and 7.
+Each rendering is returned as a propertized string."
+  (cons (with-temp-buffer
+          (insert markdown)
+          (agent-shell-markdown-replace-markup :complete t)
+          (buffer-string))
+        (seq-map (lambda (chunk-size)
+                   (with-temp-buffer
+                     (let ((i 0))
+                       (while (< i (length markdown))
+                         (goto-char (point-max))
+                         (insert (substring markdown i
+                                            (min (length markdown) (+ i chunk-size))))
+                         (setq i (+ i chunk-size))
+                         (agent-shell-markdown-replace-markup)))
+                     (agent-shell-markdown-replace-markup :complete t)
+                     (buffer-string)))
+                 '(1 3 7))))
+
+(ert-deftest agent-shell-markdown-list-skips-rendered-markup ()
+  ;; A real list marker is still plain text when lists render.  One left
+  ;; behind by already rendered markup isn't a list item: it isn't tagged
+  ;; and the blank lines around it stay.
+  (dolist (case '(("## 1. Setup\n\nbody\n" "1. Setup\n\nbody\n")
+                  ("## 1. Setup" "1. Setup")
+                  ("**1. Create**\n\n**2. Accept**\n" "1. Create\n\n2. Accept\n")
+                  ("**1.** Create\n" "1. Create\n")
+                  ("`1. Create`\n" "1. Create\n")
+                  ("[1. Create](https://a.com)\n" "1. Create\n")
+                  ("1\\. Create\n\n2\\. Accept\n" "1. Create\n\n2. Accept\n")
+                  ("\\- Create\n" "- Create\n")))
+    (ert-info ((format "Markdown: %S" (car case)))
+      (dolist (rendered (agent-shell-markdown-tests--render-all-ways (car case)))
+        (should (equal (substring-no-properties rendered) (cadr case)))
+        (should-not (text-property-not-all
+                     0 (length rendered)
+                     'agent-shell-markdown-list-rendered nil rendered))))))
+
+(ert-deftest agent-shell-markdown-list-renders-items-holding-markup ()
+  ;; A plain marker makes a list item, whatever markup follows it.
+  (let ((agent-shell-markdown-list-bullets '("•")))
+    (dolist (case '(("1. **Create**\n2. `Accept`\n" "1. Create\n2. Accept\n")
+                    ("- **Create** now\n- `Accept` it\n" "• Create now\n• Accept it\n")
+                    ("- [ ] **Create**\n" "□ Create\n")
+                    ("1. **Create**" "1. Create")))
+      (ert-info ((format "Markdown: %S" (car case)))
+        (dolist (rendered (agent-shell-markdown-tests--render-all-ways (car case)))
+          (should (equal (substring-no-properties rendered) (cadr case)))
+          (should-not (text-property-not-all
+                       0 (length rendered)
+                       'agent-shell-markdown-list-rendered t rendered)))))))
+
+(ert-deftest agent-shell-markdown-list-ordered-item-streams-in-parts ()
+  ;; A rendered ordered item keeps its number as text, so it still matches
+  ;; the marker regexp while carrying the properties of rendered markup.
+  ;; It's a real item, so the rest of its line, arriving after a complete
+  ;; render, still joins it.
+  (with-temp-buffer
+    (insert "\n")
+    (goto-char (1- (point-max)))
+    (insert "1. one (")
+    (save-restriction (narrow-to-region (point-min) (1- (point-max)))
+                      (agent-shell-markdown-replace-markup :complete t))
+    (goto-char (1- (point-max)))
+    (insert "rest)\n2. two")
+    (save-restriction (narrow-to-region (point-min) (1- (point-max)))
+                      (agent-shell-markdown-replace-markup :complete t))
+    (goto-char (point-min))
+    (search-forward "rest")
+    (should (get-text-property (match-beginning 0)
+                               'agent-shell-markdown-list-rendered))
+    (should (get-text-property (match-beginning 0) 'line-prefix))))
+
+(ert-deftest agent-shell-markdown-list-skips-external-renderer-output ()
+  ;; A renderer's output is tagged frozen but needn't stash a source, and
+  ;; the tag stopping short of the newline keeps it from being avoided.
+  (let ((agent-shell-markdown-render-functions
+         (list (lambda (_context)
+                 (add-text-properties (point-min) (+ (point-min) 6)
+                                      '(agent-shell-markdown-frozen t))
+                 nil))))
+    (with-temp-buffer
+      (insert "1. Out\n")
+      (agent-shell-markdown-replace-markup)
+      (should-not (text-property-not-all
+                   (point-min) (point-max)
+                   'agent-shell-markdown-list-rendered nil)))))
+
+(ert-deftest agent-shell-markdown-list-frames-against-rendered-markup ()
+  ;; A rendered line below a list can't fold into it, so the list still
+  ;; gets its bottom gap.
+  (let ((agent-shell-markdown-list-bullets '("•")))
+    (dolist (case '(("- a\n## 1. Setup\nbody\n" "• a\n\n1. Setup\nbody\n")
+                    ("- a\n1\\. Setup\nbody\n" "• a\n\n1. Setup\nbody\n")))
+      (ert-info ((format "Markdown: %S" (car case)))
+        (dolist (rendered (agent-shell-markdown-tests--render-all-ways (car case)))
+          (should (equal (substring-no-properties rendered) (cadr case))))))))
+
+(ert-deftest agent-shell-markdown-list-blocks-end-at-untagged-line ()
+  ;; A line that isn't a list item ends the list above it, so it's framed
+  ;; the same whether the text arrives at once or streamed in chunks.
+  (let ((agent-shell-markdown-list-bullets '("•")))
+    (dolist (case '(("- a\nprose\n- b\n" "• a\n\nprose\n\n• b\n")
+                    ("- a\n## 1. Setup\n- b\n" "• a\n\n1. Setup\n\n• b\n")
+                    ("**1. First**\n- a\n**2. Second**\n- b\n"
+                     "1. First\n• a\n\n2. Second\n• b\n")))
+      (ert-info ((format "Markdown: %S" (car case)))
+        (dolist (rendered (agent-shell-markdown-tests--render-all-ways (car case)))
+          (should (equal (substring-no-properties rendered) (cadr case))))))))
+
+(ert-deftest agent-shell-markdown-list-keeps-bold-numbered-lines-apart ()
+  ;; Bold-prefixed points like `**1. X**' aren't list items, so the blank
+  ;; line the author left between them stays.  A list right under one hangs
+  ;; off it.
   (let ((agent-shell-markdown-list-bullets '("•")))
     (with-temp-buffer
       (insert "**1. First** point.\n\n**2. Second** point:\n- a\n- b\n")
       (agent-shell-markdown-replace-markup)
       (should (equal (substring-no-properties (buffer-string))
-                     "1. First point.\n2. Second point:\n• a\n• b\n")))))
+                     "1. First point.\n\n2. Second point:\n• a\n• b\n")))))
+
+(ert-deftest agent-shell-markdown-list-hangs-off-bold-numbered-line ()
+  ;; A list directly under a bold numbered step gets no top gap, so each
+  ;; step keeps its items.  Other lines above a list still frame it.
+  (let ((agent-shell-markdown-list-bullets '("•")))
+    (dolist (case '(("**1. First**\n- a\n- b\n\n**2. Second**\n- c\n- d\n"
+                     "1. First\n• a\n• b\n\n2. Second\n• c\n• d\n")
+                    ("__1. First__\n- a\n" "1. First\n• a\n")
+                    ("**1.** First:\n- a\n" "1. First:\n• a\n")
+                    ("**- First**\n- a\n" "- First\n• a\n")
+                    ("**1. First**\n\n- a\n" "1. First\n\n• a\n")
+                    ("**1. First**\n- a\nafter\n" "1. First\n• a\n\nafter\n")
+                    ("**Steps:**\n- a\n" "Steps:\n\n• a\n")
+                    ("## 1. Setup\n- a\n" "1. Setup\n\n• a\n")
+                    ("*1. First*\n- a\n" "1. First\n\n• a\n")
+                    ("`1. First`\n- a\n" "1. First\n\n• a\n")
+                    ("intro\n- a\n" "intro\n\n• a\n")))
+      (ert-info ((format "Markdown: %S" (car case)))
+        (dolist (rendered (agent-shell-markdown-tests--render-all-ways (car case)))
+          (should (equal (substring-no-properties rendered) (cadr case))))))))
+
+(ert-deftest agent-shell-markdown-list-frames-bold-numbered-lines-against-prose ()
+  ;; A run of bold numbered steps flush against prose gets a blank line
+  ;; above and below it, like a heading.  A list hanging off the last
+  ;; step stays attached.
+  (let ((agent-shell-markdown-list-bullets '("•")))
+    (dolist (case '(("Intro\n**1. First** point.\n**2. Second** point.\nafter\n"
+                     "Intro\n\n1. First point.\n2. Second point.\n\nafter\n")
+                    ("**1. First** point.\n**2. Second** point.\nafter\n"
+                     "1. First point.\n2. Second point.\n\nafter\n")
+                    ("Intro\n**1. First** point.\n**2. Second** point.\n\nafter\n"
+                     "Intro\n\n1. First point.\n2. Second point.\n\nafter\n")
+                    ("**1. First**\n**2. Second**\n- a\n"
+                     "1. First\n2. Second\n• a\n")
+                    ("**1. First**\n**2. Second**\n**3. Third**\n"
+                     "1. First\n2. Second\n3. Third\n")
+                    ("**1. Install**\nRun it.\n**2. Configure**\nEdit it.\n"
+                     "1. Install\n\nRun it.\n\n2. Configure\n\nEdit it.\n")
+                    ("Intro:\n**1. First**\n- a\n" "Intro:\n\n1. First\n• a\n")
+                    ("**1. First**\n- a\n**2. Second**\n- b\n"
+                     "1. First\n• a\n\n2. Second\n• b\n")
+                    ("Intro\n\n**1. First**\n" "Intro\n\n1. First\n")
+                    ("Intro\n**Steps:**\n" "Intro\nSteps:\n")
+                    ("Intro\n## 1. Setup\n" "Intro\n1. Setup\n")))
+      (ert-info ((format "Markdown: %S" (car case)))
+        (dolist (rendered (agent-shell-markdown-tests--render-all-ways (car case)))
+          (should (equal (substring-no-properties rendered) (cadr case))))))))
 
 (ert-deftest agent-shell-markdown-list-keeps-blank-bordering-prose ()
   ;; A blank with a list item on only one side frames the list off from
@@ -3050,6 +3312,87 @@ after" nil)))))
   (should (equal (agent-shell-markdown--table-wrap-text "日本のfoo語" 3)
                  '("日" "本" "の" "foo" "語"))))
 
+(ert-deftest agent-shell-markdown-table-wrap-text-breaks-after-height-scaled-cjk ()
+  ;; Graphic frames put `display' (height N) on CJK chars to even out
+  ;; row heights.  Only an image's `display' blocks a break, so these
+  ;; chars stay break points.
+  (should (equal (mapcar #'substring-no-properties
+                         (agent-shell-markdown--table-wrap-text
+                          (concat "a "
+                                  (propertize "日本語" 'display '(height 0.9)))
+                          5))
+                 '("a 日" "本語"))))
+
+(defun agent-shell-markdown-tests--image-text (text)
+  "Return TEXT with a `display' image over all of it.
+As a render function shows an equation: the source stays in the
+buffer and one image is displayed in its place."
+  (propertize text 'display '(image :type svg :data "<svg/>")))
+
+(ert-deftest agent-shell-markdown-table-wrap-text-keeps-image-whole ()
+  ;; Text under one `display' image is one word: a break at a space
+  ;; inside it would show the image once on each line.
+  (let* ((image (agent-shell-markdown-tests--image-text "\\( x + y \\)"))
+         (lines (agent-shell-markdown--table-wrap-text
+                 (concat "a " image " b") 5)))
+    (should (equal lines '("a" "\\( x + y \\)" "b")))
+    (should (equal-including-properties (nth 1 lines) image))))
+
+(ert-deftest agent-shell-markdown-table-pixel-path-p-includes-images ()
+  ;; An image over plain ASCII alt text must be padded in pixels too,
+  ;; or the cell is padded as if it were its alt text.
+  (should-not (agent-shell-markdown--table-pixel-path-p "foo"))
+  (should (agent-shell-markdown--table-pixel-path-p "日本"))
+  (should (agent-shell-markdown--table-pixel-path-p
+           (propertize "foo" 'face 'bold)))
+  (should (agent-shell-markdown--table-pixel-path-p
+           (agent-shell-markdown-tests--image-text "foo"))))
+
+(ert-deftest agent-shell-markdown-table-fit-images-caps-markdown-images ()
+  ;; A markdown image is shrunk to one line and stops tracking the
+  ;; window width, so `rerender-images' can't undo the cap.
+  (skip-unless (image-type-available-p 'svg))
+  (let ((file (make-temp-file "agent-shell-table-image" nil ".svg"
+                              "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"600\" height=\"600\"/>")))
+    (unwind-protect
+        (let* ((text (propertize "icon"
+                                 'display (create-image file nil nil :max-width 500)
+                                 'agent-shell-markdown-image-width-ratio 'default
+                                 'agent-shell-markdown-image-window-width 1000))
+               (fitted (agent-shell-markdown--table-fit-images :text text)))
+          (should (= (image-property (get-text-property 0 'display fitted)
+                                     :max-height)
+                     (frame-char-height)))
+          (should (eq (image-property (get-text-property 0 'display fitted)
+                                      :ascent)
+                      'center))
+          (should (= (image-property (get-text-property 0 'display fitted)
+                                     :max-width)
+                     500))
+          (should-not (get-text-property
+                       0 'agent-shell-markdown-image-width-ratio fitted))
+          (should-not (get-text-property
+                       0 'agent-shell-markdown-image-window-width fitted))
+          (should (get-text-property
+                   0 'agent-shell-markdown-image-width-ratio text)))
+      (delete-file file))))
+
+(ert-deftest agent-shell-markdown-table-fit-images-leaves-other-images ()
+  ;; Images a render function drew (e.g. equations) aren't ours to size.
+  (let ((text (agent-shell-markdown-tests--image-text "\\( x \\)")))
+    (should (equal-including-properties
+             (agent-shell-markdown--table-fit-images :text text)
+             text))))
+
+(ert-deftest agent-shell-markdown-table-longest-word-counts-image-whole ()
+  ;; A column is at least as wide as an image in it.  Without a
+  ;; graphical window, the image counts as the text it covers.
+  (should (= 11 (agent-shell-markdown--table-longest-word
+                 :str (concat "a "
+                              (agent-shell-markdown-tests--image-text
+                               "\\( x + y \\)")
+                              " b")))))
+
 (ert-deftest agent-shell-markdown-mirrors-face-to-font-lock-face ()
   ;; Faces are mirrored to `font-lock-face' so our styling survives
   ;; `font-lock-mode' re-fontification in comint / shell-maker buffers.
@@ -3156,6 +3499,100 @@ after" nil)))))
         (setq calls 0)
         (agent-shell-markdown-rerender-tables)
         (should (= calls 0))))))
+
+(ert-deftest agent-shell-markdown-rerender-table-from-source ()
+  ;; With SOURCE, the table at POS is laid out from it, SOURCE becomes
+  ;; its stored source, and the text around the table is left alone.
+  (with-temp-buffer
+    (insert "before\n\n| A | B |\n|---|---|\n| 1 | 2 |\n\nafter\n")
+    (agent-shell-markdown-replace-markup)
+    (goto-char (point-min))
+    (search-forward "1")
+    (let* ((pos (match-beginning 0))
+           (stored (get-text-property pos 'agent-shell-markdown-table-source))
+           (source (replace-regexp-in-string "| 1 |" "| 123 |" stored t t)))
+      (should (eq (agent-shell-markdown-rerender-table
+                   :position pos :source source) source))
+      (goto-char (point-min))
+      (search-forward "123")
+      (should (eq (get-text-property (match-beginning 0)
+                                     'agent-shell-markdown-table-source)
+                  source))
+      (should (string-prefix-p "before\n\n" (buffer-string)))
+      (should (string-suffix-p "\n\nafter\n" (buffer-string))))))
+
+(ert-deftest agent-shell-markdown-rerender-table-from-stored-source ()
+  ;; Without SOURCE, the table is laid out again from its stored source,
+  ;; which is returned.
+  (with-temp-buffer
+    (insert "| A | B |\n|---|---|\n| 1 | 2 |\n")
+    (agent-shell-markdown-replace-markup)
+    (let ((rendered (buffer-string))
+          (stored (get-text-property (point-min)
+                                     'agent-shell-markdown-table-source)))
+      (should (equal (agent-shell-markdown-rerender-table
+                      :position (point-min))
+                     stored))
+      (should (equal (buffer-string) rendered)))))
+
+(ert-deftest agent-shell-markdown-rerender-table-outside-a-table ()
+  ;; POS outside a laid-out table: nil, and the buffer is not touched.
+  (with-temp-buffer
+    (insert "text\n\n| A | B |\n|---|---|\n| 1 | 2 |\n")
+    (agent-shell-markdown-replace-markup)
+    (let ((rendered (buffer-string)))
+      (should-not (agent-shell-markdown-rerender-table
+                   :position (point-min)))
+      (should (equal (buffer-string) rendered)))))
+
+(ert-deftest agent-shell-markdown-table-at-returns-source-and-bounds ()
+  ;; Any position in a rendered table yields the same source and bounds,
+  ;; which span exactly the table's rendered text.
+  (with-temp-buffer
+    (insert "before\n\n| A | B |\n|---|---|\n| 1 | 2 |\n\nafter\n")
+    (agent-shell-markdown-replace-markup)
+    (goto-char (point-min))
+    (search-forward "A")
+    (let ((table (agent-shell-markdown-table-at (match-beginning 0))))
+      (should (eq (map-elt table :source)
+                  (get-text-property (match-beginning 0)
+                                     'agent-shell-markdown-table-source)))
+      (should (equal (buffer-substring (point-min) (map-elt table :start))
+                     "before\n\n"))
+      (should (string-prefix-p "\n\nafter"
+                               (buffer-substring (map-elt table :end)
+                                                 (point-max))))
+      (should (equal (agent-shell-markdown-table-at (map-elt table :start))
+                     table))
+      (should (equal (agent-shell-markdown-table-at (1- (map-elt table :end)))
+                     table)))))
+
+(ert-deftest agent-shell-markdown-table-at-outside-a-table ()
+  (with-temp-buffer
+    (insert "text\n\n| A | B |\n|---|---|\n| 1 | 2 |\n")
+    (agent-shell-markdown-replace-markup)
+    (should-not (agent-shell-markdown-table-at (point-min)))))
+
+(ert-deftest agent-shell-markdown-rerender-table-in-read-only-text ()
+  ;; A shell buffer's output is read-only.  The re-layout is not an
+  ;; edit: it goes through, stays off the undo list and leaves the
+  ;; buffer unmodified.
+  (with-temp-buffer
+    (insert "| A | B |\n|---|---|\n| 1 | 2 |\n")
+    (agent-shell-markdown-replace-markup)
+    (put-text-property (point-min) (point-max) 'read-only t)
+    (set-buffer-modified-p nil)
+    (setq buffer-undo-list nil)
+    (let ((source (replace-regexp-in-string
+                   "| 1 |" "| 123 |"
+                   (get-text-property (point-min)
+                                      'agent-shell-markdown-table-source)
+                   t t)))
+      (agent-shell-markdown-rerender-table
+       :position (point-min) :source source)
+      (should (string-match-p "123" (buffer-string)))
+      (should-not (buffer-modified-p))
+      (should-not buffer-undo-list))))
 
 (ert-deftest agent-shell-markdown-carry-properties-drops-font-lock-face ()
   ;; `font-lock-face' is our own styling (mirrored from `face'), not a
@@ -5055,11 +5492,11 @@ Searches with `case-fold-search' nil, as
               (should (equal (get-text-property 1 'face (cddr display))
                              '((:underline nil) agent-shell-markdown-inline-code)))
               (should (eval (cadr display) t))
-              (funcall (lookup-key (get-text-property (point-min) 'keymap) (kbd "RET")))
+              (agent-shell-markdown-open-link-at-point (point-min))
               (should (equal (buffer-string) "docs and other"))
               (should-not (eval (cadr display) t)))
             ;; Opening again records nothing new.
-            (funcall (lookup-key (get-text-property (point-min) 'keymap) (kbd "RET"))))
+            (agent-shell-markdown-open-link-at-point (point-min)))
           (let ((links (agent-shell-markdown--read-tracked-links tracking-file)))
             (should (equal (length links) 1))
             (should (equal (map-elt (seq-first links) :url) "https://example.com/docs"))
@@ -5084,7 +5521,7 @@ Searches with `case-fold-search' nil, as
       (with-temp-buffer
         (insert (agent-shell-markdown-convert "[docs](https://example.com/docs)"
                                               :tracking-file tracking-file))
-        (funcall (lookup-key (get-text-property (point-min) 'keymap) (kbd "RET")))))
+        (agent-shell-markdown-open-link-at-point (point-min))))
     (should-not (file-exists-p tracking-file))))
 
 (ert-deftest agent-shell-markdown-parse-link-attributes ()

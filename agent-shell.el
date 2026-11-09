@@ -4,10 +4,10 @@
 
 ;; Author: Alvaro Ramirez https://xenodium.com
 ;; URL: https://github.com/xenodium/agent-shell
-;; Version: 0.91.1
+;; Version: 0.94.2
 ;; Package-Requires: ((emacs "29.1") (shell-maker "0.98.2") (acp "0.17.1"))
 
-(defconst agent-shell--version "0.91.1")
+(defconst agent-shell--version "0.94.2")
 
 ;; Minimum dependency versions, as declared in the `Package-Requires'
 ;; header above.  Package managers that resolve versions enforce the
@@ -435,10 +435,12 @@ bullet, while a body of prose is untouched."
                     (save-excursion
                       (goto-char (point-max))
                       (beginning-of-line)
-                      (and (looking-at-p
+                      (and (looking-at
                             agent-shell-markdown--list-item-last-line-regexp)
                            (not (get-text-property
-                                 (point) 'agent-shell-markdown-list-rendered))))
+                                 (point) 'agent-shell-markdown-list-rendered))
+                           (not (agent-shell-markdown--rendered-list-marker-p
+                                 (match-beginning 2) (match-end 2)))))
                     ;; A blockquote line or header whose newline never
                     ;; arrived.  A rendered header has lost its `#'s.
                     (save-excursion
@@ -1438,6 +1440,10 @@ With \\[universal-argument] prefix ARG, submit through
 `agent-shell-busy-submit-override-function' instead, which steers by
 default.  \\[agent-shell-submit-override] is bound to the same thing.
 
+With ARG at an empty prompt mid-turn, call
+`agent-shell-busy-submit-reroute-function' instead, which by default
+offers to steer the most recently queued prompt.
+
 This owns the `agent-shell-submit' name because shell-maker's
 per-start aliasing is disabled (see the `:alias-commands nil' call in
 `agent-shell--start')."
@@ -1448,9 +1454,12 @@ per-start aliasing is disabled (see the `:alias-commands nil' call in
               (eq agent-shell-session-strategy 'new-deferred))
     (user-error "Starting agent, please wait"))
   (if (shell-maker-busy)
-      (when-let* ((prompt (agent-shell--prompt-input)))
-        (agent-shell--busy-submit :prompt prompt :override arg)
-        (agent-shell--clear-prompt-input))
+      (if-let* ((prompt (agent-shell--prompt-input)))
+          (progn
+            (agent-shell--busy-submit :prompt prompt :override arg)
+            (agent-shell--clear-prompt-input))
+        (when (and arg agent-shell-busy-submit-reroute-function)
+          (funcall agent-shell-busy-submit-reroute-function)))
     (shell-maker-submit)))
 
 (defun agent-shell-submit-override ()
@@ -1461,7 +1470,11 @@ Submits through `agent-shell-busy-submit-override-function' rather than
 steering is not the default is one keystroke away.
 
 Only differs from \\[agent-shell-submit] while the agent is working:
-with no turn to queue behind or steer into, both simply submit."
+with no turn to queue behind or steer into, both simply submit.
+
+At an empty prompt mid-turn, calls
+`agent-shell-busy-submit-reroute-function' instead, so a prompt queued
+by mistake can still be sent another way (steered by default)."
   (declare (modes agent-shell-mode))
   (interactive)
   (agent-shell-submit '(4)))
@@ -1914,6 +1927,7 @@ listed first and offered as the default selection."
                                '(metadata
                                  (category . agent-shell-config)
                                  (display-sort-function . identity)
+                                 (cycle-sort-function . identity)
                                  (affixation-function
                                   . agent-shell--icon-affixation))
                              (complete-with-action action (mapcar #'car choices)
@@ -2109,6 +2123,7 @@ buffers are available or nothing was selected."
                        (if (eq action 'metadata)
                            '(metadata
                              (display-sort-function . identity)
+                             (cycle-sort-function . identity)
                              (affixation-function
                               . agent-shell--icon-affixation))
                          (complete-with-action action (mapcar #'car choices)
@@ -4327,7 +4342,8 @@ see https://github.com/xenodium/agent-shell/issues/217, while goose sends
 before/after/path; see https://github.com/xenodium/agent-shell/issues/569).
 
 Returns a list of alists with oldText/newText/path keys, normalizing
-rawInput variants to that shape."
+rawInput variants to that shape.  Items parsed from a unified diff also
+carry a line key with their hunk's starting line."
   (let ((content (map-elt acp-tool-call 'content))
         (raw-input (map-elt acp-tool-call 'rawInput)))
     (cond
@@ -4349,14 +4365,18 @@ rawInput variants to that shape."
       (list `((oldText . ,(or (map-elt raw-input 'old_str) ""))
               (newText . ,(map-elt raw-input 'new_str))
               (path . ,(map-elt raw-input 'path)))))
-     ;; Attempt diff from rawInput (eg. Copilot).
+     ;; Attempt diff from rawInput (eg. Copilot).  One item per hunk,
+     ;; so distant hunks aren't rendered as adjacent.  See
+     ;; https://github.com/xenodium/agent-shell/issues/931
      ((and raw-input (map-elt raw-input 'diff))
-      (let ((parsed (agent-shell--parse-unified-diff
-                     (map-elt raw-input 'diff))))
-        (list `((oldText . ,(car parsed))
-                (newText . ,(cdr parsed))
-                (path . ,(or (map-elt raw-input 'fileName)
-                             (map-elt raw-input 'path)))))))
+      (mapcar (lambda (hunk)
+                `((oldText . ,(map-elt hunk :old))
+                  (newText . ,(map-elt hunk :new))
+                  (path . ,(or (map-elt raw-input 'fileName)
+                               (map-elt raw-input 'path)))
+                  (line . ,(map-elt hunk :line))))
+              (agent-shell--parse-unified-diff
+               (map-elt raw-input 'diff))))
      ;; Attempt diff from rawInput (eg. goose).
      ((and raw-input (map-elt raw-input 'before))
       (list `((oldText . ,(or (map-elt raw-input 'before) ""))
@@ -4367,11 +4387,12 @@ rawInput variants to that shape."
   "Convert a single ACP-DIFF-ITEM to a diff info alist.
 
 ACP-DIFF-ITEM is an alist with oldText/newText/path keys, as produced by
-`agent-shell--diff-items'.
+`agent-shell--diff-items'.  Its optional line key (a hunk's starting
+line) is carried as a hint for locating the change.
 
-LOCATIONS is the ACP tool call `locations' array.  When an entry's path
-matches the diff, its line is carried as a hint for locating the change.
-It is optional (and often absent), but authoritative when present.
+LOCATIONS is the ACP tool call `locations' array.  When ACP-DIFF-ITEM has
+no line and an entry's path matches the diff, the entry's line is
+carried as the hint instead.  It is optional (and often absent).
 
 Returns an alist of the form:
 
@@ -4380,7 +4401,7 @@ Returns an alist of the form:
    (:file . file-path)
    (:line . hint-line))
 
-The :line entry is omitted when no matching location line is available.
+The :line entry is omitted when no line is available.
 Returns nil when the item has no newText or path."
   (when-let* ((new-text (map-elt acp-diff-item 'newText))
               (file-path (map-elt acp-diff-item 'path)))
@@ -4390,30 +4411,51 @@ Returns nil when the item has no newText or path."
      (list (cons :old (or (map-elt acp-diff-item 'oldText) ""))
            (cons :new new-text)
            (cons :file file-path))
-     (when-let* ((location (seq-find (lambda (location)
-                                       (equal (map-elt location 'path) file-path))
-                                     locations))
-                 (line (map-elt location 'line)))
+     (when-let* ((line (or (map-elt acp-diff-item 'line)
+                           (map-elt (seq-find (lambda (location)
+                                                (equal (map-elt location 'path) file-path))
+                                              locations)
+                                    'line))))
        (list (cons :line line))))))
 
 ;; Based on https://github.com/editor-code-assistant/eca-emacs/blob/298849d1aae3241bf8828b6558c6deb45d75a3c8/eca-diff.el#L22
 (defun agent-shell--parse-unified-diff (diff-string)
-  "Parse unified DIFF-STRING into old and new text.
-Returns a cons cell (OLD-TEXT . NEW-TEXT)."
-  (let (old-lines new-lines in-hunk)
-    (dolist (line (split-string diff-string "\n"))
+  "Return the hunks in unified DIFF-STRING as a list of alists.
+
+Hunks are kept separate so that changes far apart in the file are not
+rendered as adjacent.  For example:
+
+  @@ -29,2 +29,1 @@
+   a
+  -b
+  @@ -179,2 +178,2 @@
+   c
+  +d
+
+returns:
+
+  (((:old . \"a\\nb\\n\") (:new . \"a\\n\") (:line . 29))
+   ((:old . \"c\\n\") (:new . \"c\\nd\\n\") (:line . 179)))
+
+where :line is the hunk's starting line in the old file."
+  (let (hunks)
+    (dolist (diff-line (split-string diff-string "\n"))
       (cond
-       ((string-match "^@@.*@@" line)
-        (setq in-hunk t))
-       ((and in-hunk (string-prefix-p " " line))
-        (push (substring line 1) old-lines)
-        (push (substring line 1) new-lines))
-       ((and in-hunk (string-prefix-p "-" line))
-        (push (substring line 1) old-lines))
-       ((and in-hunk (string-prefix-p "+" line))
-        (push (substring line 1) new-lines))))
-    (cons (string-join (nreverse old-lines) "\n")
-          (string-join (nreverse new-lines) "\n"))))
+       ((string-match "^@@ -\\([0-9]+\\)" diff-line)
+        (push (list (cons :old "")
+                    (cons :new "")
+                    (cons :line (string-to-number (match-string 1 diff-line))))
+              hunks))
+       ((and hunks (string-match "^\\([ +-]\\)\\(.*\\)" diff-line))
+        (let ((prefix (match-string 1 diff-line))
+              (text (concat (match-string 2 diff-line) "\n")))
+          (unless (equal prefix "+")
+            (setf (map-elt (car hunks) :old)
+                  (concat (map-elt (car hunks) :old) text)))
+          (unless (equal prefix "-")
+            (setf (map-elt (car hunks) :new)
+                  (concat (map-elt (car hunks) :new) text)))))))
+    (nreverse hunks)))
 
 (defun agent-shell--format-diff-as-text (diff)
   "Format DIFF info as text suitable for display in tool call body.
@@ -5309,6 +5351,7 @@ variable (see makunbound)"))
       (setq-local filter-buffer-substring-function #'agent-shell--filter-buffer-substring)
       (setq-local beginning-of-defun-function #'agent-shell--beginning-of-block)
       (setq-local end-of-defun-function #'agent-shell--end-of-block)
+      (add-hook 'xref-backend-functions #'agent-shell-markdown-xref-backend nil t)
       (agent-shell--update-header-and-mode-line)
       (add-hook 'kill-buffer-hook #'agent-shell--clean-up nil t)
       (add-hook 'kill-buffer-query-functions
@@ -5950,8 +5993,8 @@ insert the character instead."
     ;; when there's a prefix: its own cells and the links in them are
     ;; behind the search from there, so it lands past the table.
     (when-let* ((leave-table)
-                (table (agent-shell-markdown-table--region-at-point)))
-      (goto-char (cdr table)))
+                (table (agent-shell-markdown-table-at (point))))
+      (goto-char (map-elt table :end)))
     (let* ((current-pos (point))
            (prompt-pos (save-mark-and-excursion
                          (when (comint-next-prompt 1)
@@ -6020,8 +6063,8 @@ insert the character instead."
     ;; when there's a prefix, as `agent-shell-next-item' does from its
     ;; end.
     (when-let* ((leave-table)
-                (table (agent-shell-markdown-table--region-at-point)))
-      (goto-char (car table)))
+                (table (agent-shell-markdown-table-at (point))))
+      (goto-char (map-elt table :start)))
     (let* ((current-pos (point))
            (prompt-pos (save-mark-and-excursion
                          (when (comint-next-prompt (- 1))
@@ -8097,6 +8140,7 @@ Falls back to latest session in batch mode (e.g. tests)."
                                (if (eq action 'metadata)
                                    '(metadata
                                      (display-sort-function . identity)
+                                     (cycle-sort-function . identity)
                                      (eager-display . t)
                                      (eager-update . t))
                                  (complete-with-action action session-choices string pred)))
@@ -12200,27 +12244,37 @@ Deferred worker for `agent-shell--realign-on-change'."
       (agent-shell-markdown-rerender-images))))
 
 (defun agent-shell--realign-on-change (window)
-  "Re-align the current buffer's window-relative markdown shown in WINDOW.
+  "Re-align the window-relative markdown of the buffer shown in WINDOW.
 
 Installed buffer-locally on `window-size-change-functions' and
-`window-buffer-change-functions' (whose buffer-local values are
-called with the window, the buffer current), so it runs only for
-shell windows.  Table column widths and percentage image sizes are
-measured against the display, so a resize or first display can change
-them; schedule a re-render on any such change.  What actually needs
-re-doing is decided per-item by `agent-shell-markdown-rerender-tables'
-and `agent-shell-markdown-rerender-images' (via their stored widths),
+`window-buffer-change-functions', so it runs only for shell windows.
+Acts on WINDOW's buffer rather than the current one: before Emacs 31
+these hooks run with whatever buffer redisplay had current (usually
+the selected window's).  Since Emacs 31 the buffer-change hook also
+runs for a buffer removed from WINDOW, in which case WINDOW's buffer
+is some other buffer; skip it unless it re-aligns too.
+
+Table column widths and percentage image sizes are measured against
+the display, so a resize or first display can change them; schedule a
+re-render on any such change.  What actually needs re-doing is decided
+per-item by `agent-shell-markdown-rerender-tables' and
+`agent-shell-markdown-rerender-images' (via their stored widths),
 so this can fire freely: it also catches content rendered while the
 buffer was off-screen and then brought back into a same-width window.
 Deferred to an idle timer, which also debounces a drag-resize into a
 single re-render, because modifying a buffer from within these
 redisplay hooks is unsafe."
-  (when (window-live-p window)
-    (when (timerp agent-shell--realign-timer)
-      (cancel-timer agent-shell--realign-timer))
-    (setq agent-shell--realign-timer
-          (run-with-idle-timer 0.15 nil #'agent-shell--realign-rendered
-                               (current-buffer)))))
+  (when-let* (((window-live-p window))
+              (buffer (window-buffer window))
+              ((memq #'agent-shell--realign-on-change
+                     (buffer-local-value 'window-size-change-functions
+                                         buffer))))
+    (with-current-buffer buffer
+      (when (timerp agent-shell--realign-timer)
+        (cancel-timer agent-shell--realign-timer))
+      (setq agent-shell--realign-timer
+            (run-with-idle-timer 0.15 nil #'agent-shell--realign-rendered
+                                 buffer)))))
 
 (defun agent-shell--enable-realign ()
   "Keep the current buffer's rendered markdown aligned to its window.
