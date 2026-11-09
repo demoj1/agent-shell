@@ -19,7 +19,7 @@
 
 (define-derived-mode agent-shell-easysession-placeholder-mode special-mode
   "Agent Resume"
-  "Wait until displayed or RET is pressed to resume an agent session.")
+  "Wait until RET is pressed to resume an agent session.")
 
 (defun agent-shell-easysession--save ()
   "Return session data, for example ((session-id . \"abc\") (agent . claude-code))."
@@ -54,21 +54,55 @@
       (setq-local default-directory directory)
       (setq-local agent-shell-easysession--data (map-elt item 'data))
       (let ((inhibit-read-only t))
-        (insert (format "⏸ %s · %s · сессия %s — RET или откройте окно для resume\n"
+        (insert (format "⏸ %s · %s · сессия %s — RET для resume\n"
                         (map-elt agent-shell-easysession--data 'agent)
                         directory
                         (truncate-string-to-width
                          (map-elt agent-shell-easysession--data 'session-id) 8))))
-      (set-buffer-modified-p nil)
-      (add-hook 'window-buffer-change-functions
-                #'agent-shell-easysession--window-change nil t))
+      (set-buffer-modified-p nil))
     buffer))
 
-(defun agent-shell-easysession--window-change (window)
-  "Resume the pending shell displayed in WINDOW."
-  (with-current-buffer (window-buffer window)
-    (when (eq major-mode 'agent-shell-easysession-placeholder-mode)
-      (agent-shell-easysession-resume))))
+;;;###autoload
+(defun agent-shell-unload ()
+  "Stop the current agent and keep a placeholder for resuming with RET.
+
+Works from shell and viewport buffers.  Refuse busy shells and sessions
+without a saved identifier.  Preserve the name, directory and session ID;
+resume remains explicit after saving and restoring with EasySession."
+  (declare (modes agent-shell-mode
+                  agent-shell-viewport-view-mode
+                  agent-shell-viewport-edit-mode))
+  (interactive)
+  (let* ((shell (or (agent-shell--current-shell)
+                    (user-error "Not in a shell or viewport buffer")))
+         (viewport (agent-shell-viewport--buffer :shell-buffer shell :existing-only t))
+         (windows (append (get-buffer-window-list shell nil t)
+                          (when viewport (get-buffer-window-list viewport nil t))))
+         (name (buffer-name shell))
+         (directory (buffer-local-value 'default-directory shell))
+         (cleanup (buffer-local-value 'agent-shell--pending-directory-cleanup shell))
+         (data (with-current-buffer shell (agent-shell-easysession--save))))
+    (when (agent-shell--active-requests-p (buffer-local-value 'agent-shell--state shell))
+      (user-error "Agent is busy; wait for it to finish before unloading"))
+    (unless (and data (agent-shell-easysession--config data))
+      (user-error "Session has no resumable identifier or available agent"))
+    (when cleanup
+      (setq data (append data `((pending-directory-cleanup . ,cleanup)))))
+    ;; Unloading must not delete the directory needed by the resumed session.
+    (with-current-buffer shell
+      (setq-local agent-shell--pending-directory-cleanup nil))
+    (unwind-protect
+        (unless (kill-buffer shell)
+          (user-error "Cancelled"))
+      (when (buffer-live-p shell)
+        (with-current-buffer shell
+          (setq-local agent-shell--pending-directory-cleanup cleanup))))
+    (let* ((default-directory directory)
+           (pending (agent-shell-easysession--restore
+                     `((buffer-name . ,name) (data . ,data)))))
+      (dolist (window (seq-filter #'window-live-p windows))
+        (set-window-buffer window pending))
+      pending)))
 
 (defun agent-shell-easysession-resume ()
   "Replace the current placeholder with its resumed agent shell."
@@ -81,8 +115,6 @@
          (name (buffer-name))
          (directory default-directory)
          (windows (get-buffer-window-list (current-buffer) nil t)))
-    (remove-hook 'window-buffer-change-functions
-                 #'agent-shell-easysession--window-change t)
     (unless (kill-buffer (current-buffer))
       (user-error "Cancelled"))
     (let* ((default-directory directory)
@@ -95,20 +127,20 @@
                ;; Keep failed sessions available for an explicit retry.
                (let ((pending (agent-shell-easysession--restore
                                `((buffer-name . ,name) (data . ,data)))))
-                 (with-current-buffer pending
-                   (remove-hook 'window-buffer-change-functions
-                                #'agent-shell-easysession--window-change t))
                  (dolist (window (seq-filter #'window-live-p windows))
                    (set-window-buffer window pending)))
                (signal (car err) (cdr err))))))
       (shell-maker-set-buffer-name buffer name)
+      (with-current-buffer buffer
+        (setq-local agent-shell--pending-directory-cleanup
+                    (map-elt data 'pending-directory-cleanup)))
       (dolist (window (seq-filter #'window-live-p windows))
         (set-window-buffer window buffer))
       buffer)))
 
 ;;;###autoload
 (define-minor-mode agent-shell-easysession-mode
-  "Persist agent sessions and resume them when their buffers are displayed."
+  "Persist agent sessions and resume them when RET is pressed."
   :global t
   :group 'agent-shell
   (dolist (mode '(agent-shell-mode agent-shell-easysession-placeholder-mode))
