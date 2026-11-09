@@ -115,5 +115,32 @@
                               window-buffer-change-functions))))
       (when (get-buffer " *failed-agent-test*") (kill-buffer " *failed-agent-test*")))))
 
+(ert-deftest agent-shell-easysession-layout-test ()
+  (let* ((directory (make-temp-file "agent-shell-easysession-test-" t))
+         (easysession-directory directory)
+         (easysession--managed-major-modes nil)
+         (agent-shell-easysession-mode nil)
+         (agent-shell-agent-configs '(((:identifier . claude-code))))
+         (easysession--current-session-name nil)
+         (easysession--session-loaded nil)
+         (easysession-visible-buffer-list-include-names '(" *layout-agent-test*"))
+         (item '((buffer-name . " *layout-agent-test*")
+                 (data . ((session-id . "123") (agent . claude-code))))))
+    (unwind-protect
+        (save-window-excursion
+          (agent-shell-easysession-mode 1)
+          (delete-other-windows)
+          (set-window-buffer (selected-window)
+                             (agent-shell-easysession--restore item))
+          (easysession-save "isolated")
+          (kill-buffer " *layout-agent-test*")
+          (easysession-load "isolated")
+          (should (equal (buffer-name (window-buffer)) " *layout-agent-test*"))
+          (with-current-buffer (window-buffer)
+            (should (eq major-mode 'agent-shell-easysession-placeholder-mode))
+            (should (equal agent-shell-easysession--data (map-elt item 'data)))))
+      (when (get-buffer " *layout-agent-test*") (kill-buffer " *layout-agent-test*"))
+      (delete-directory directory t))))
+
 (provide 'agent-shell-easysession-tests)
 ;;; agent-shell-easysession-tests.el ends here
