@@ -273,14 +273,60 @@ without an `agent-shell-chat--tag' are left alone."
       (agent-shell-chat-mode-tests--marker)
       (insert "hi there\n")
       (agent-shell-chat--relabel)
-      (should (member '((:text . "Me") (:role . user) (:prompt-start . 1)) labels))
-      (should (member '((:text . "Claude") (:role . agent) (:prompt-start . 1)) labels))
+      (should (member '((:text . "Me") (:role . user) (:prompt-start . 1) (:steered . nil)) labels))
+      (should (member '((:text . "Claude") (:role . agent) (:prompt-start . 1) (:steered . nil)) labels))
       (should (string-match-p
                "<Me>" (agent-shell-chat-mode-tests--label-string
                        (car (agent-shell-chat-mode-tests--me-overlays)))))
       (should (string-match-p
                "<Claude>" (agent-shell-chat-mode-tests--agent-label-string
                            (car (agent-shell-chat-mode-tests--agent-overlays))))))))
+
+(ert-deftest agent-shell-chat-boxed-label-steered-test ()
+  "The default label marks a steered prompt's `Me'."
+  (let ((me (agent-shell-chat-boxed-label
+             '((:text . "Me") (:role . user) (:steered . t)))))
+    (should (equal " Me  steer" me))
+    (should (eq 'agent-shell-chat-me-label (get-text-property 0 'face me)))
+    (should (eq 'default (get-text-property (string-match "steer" me) 'face me)))))
+
+(ert-deftest agent-shell-chat-steered-prompt-test ()
+  "A steered prompt keeps its `Me' label, marked as steered.
+Its `[steer] ' prefix stays in the buffer but is hidden with the prompt,
+since the label now says so."
+  (let* ((labels nil)
+         (agent-shell-chat-label-function
+          (lambda (label)
+            (push label labels)
+            (agent-shell-chat-boxed-label label))))
+    (agent-shell-chat-mode-tests--with-shell
+      (agent-shell-chat-mode-tests--prompt "Claude> ")
+      (insert "list the files")
+      (agent-shell-chat-mode-tests--marker)
+      (insert "\nListing\n\n")
+      (let ((steer-start (point)))
+        (agent-shell-chat-mode-tests--prompt "Claude> ")
+        (insert (propertize "[steer] " 'agent-shell-steer-prefix t)
+                "just the filenames")
+        (agent-shell-chat-mode-tests--marker)
+        (insert "\nDone\n\n")
+        (agent-shell-chat-mode-tests--prompt "Claude> ")
+        (agent-shell-chat--relabel)
+        (should (member `((:text . "Me") (:role . user)
+                          (:prompt-start . ,steer-start) (:steered . t))
+                        labels))
+        (should (member '((:text . "Me") (:role . user)
+                          (:prompt-start . 1) (:steered . nil))
+                        labels))
+        ;; The first turn's, the steered one's, then the live prompt's.
+        (let ((steered (nth 1 (agent-shell-chat-mode-tests--me-overlays))))
+          (should (string-match-p
+                   "Me  steer" (agent-shell-chat-mode-tests--label-string steered)))
+          ;; Covers the prefix, stopping at the input proper.
+          (should (equal "just the filenames"
+                         (buffer-substring-no-properties
+                          (overlay-end steered)
+                          (+ (overlay-end steered) (length "just the filenames"))))))))))
 
 (ert-deftest agent-shell-chat-label-function-prompt-start-test ()
   "Both labels of a turn are told where its prompt starts; the live prompt is not."
@@ -300,12 +346,12 @@ without an `agent-shell-chat--tag' are left alone."
       (insert "second\n\n")
       (agent-shell-chat-mode-tests--prompt "Claude> ")
       (agent-shell-chat--relabel)
-      (should (member '((:text . "Me") (:role . user) (:prompt-start . 1)) labels))
-      (should (member '((:text . "Claude") (:role . agent) (:prompt-start . 1)) labels))
-      (should (member '((:text . "Me") (:role . user) (:prompt-start . 47)) labels))
-      (should (member '((:text . "Claude") (:role . agent) (:prompt-start . 47)) labels))
+      (should (member '((:text . "Me") (:role . user) (:prompt-start . 1) (:steered . nil)) labels))
+      (should (member '((:text . "Claude") (:role . agent) (:prompt-start . 1) (:steered . nil)) labels))
+      (should (member '((:text . "Me") (:role . user) (:prompt-start . 47) (:steered . nil)) labels))
+      (should (member '((:text . "Claude") (:role . agent) (:prompt-start . 47) (:steered . nil)) labels))
       ;; The live prompt is labeled, but stands for no turn yet.
-      (should (member '((:text . "Me") (:role . user) (:prompt-start . nil)) labels)))))
+      (should (member '((:text . "Me") (:role . user) (:prompt-start . nil) (:steered . nil)) labels)))))
 
 (ert-deftest agent-shell-chat-row-props-test ()
   "A row holding a `display' is drawn as a `before-string'."
@@ -916,6 +962,94 @@ steer fires no event, so it stayed hidden until something else relabeled
         (cancel-timer agent-shell-chat--relabel-timer)
         (agent-shell-chat--relabel-buffer (current-buffer))
         (should (string-match-p "declined" (funcall shown)))
+        (agent-shell-chat--disable)))))
+
+(defun agent-shell-chat-mode-tests--overlay-snapshot ()
+  "Return every chat label overlay's tag, span and drawing properties."
+  (sort (seq-keep
+         (lambda (overlay)
+           (when-let* ((tag (overlay-get overlay 'agent-shell-chat--tag)))
+             (format "%S" (list tag (overlay-start overlay) (overlay-end overlay)
+                                (seq-map (lambda (prop) (overlay-get overlay prop))
+                                         '(before-string display line-prefix
+                                                         wrap-prefix after-string))))))
+         (overlays-in (point-min) (point-max)))
+        #'string<))
+
+(ert-deftest agent-shell-chat-relabels-last-turn-test ()
+  "Relabeling the last turn alone matches relabeling the whole buffer.
+
+Streamed output lands before the live prompt, inside its label overlay,
+and relabeling from the last end-of-prompt marker uncovers it."
+  (with-temp-buffer
+    (setq-local agent-shell--state '((:agent-config . ((:mode-line-name . "Claude"))))
+                agent-shell-chat-mode t)
+    (agent-shell-chat-mode-tests--prompt "Claude> ")
+    (insert "first\n")
+    (agent-shell-chat-mode-tests--marker)
+    (insert "one\n\n")
+    (agent-shell-chat-mode-tests--prompt "Claude> ")
+    (insert "second\n")
+    (agent-shell-chat-mode-tests--marker)
+    (insert "two\n\n")
+    (agent-shell-chat-mode-tests--prompt "Claude> ")
+    (let ((agent-shell-prompt-bar-mode nil)
+          (agent-shell-chat-label-function
+           (lambda (label)
+             (format " %s %S " (map-elt label :text) (map-elt label :prompt-start)))))
+      (agent-shell-chat--relabel)
+      (save-excursion
+        (goto-char (- (point-max) (length "Claude> ")))
+        (insert "streamed\n\n"))
+      (should-not (string-match-p "streamed" (agent-shell-chat--displayed-substring
+                                              (point-min) (point-max))))
+      (agent-shell-chat--relabel (agent-shell-chat--last-marker-start))
+      (should (string-match-p "streamed" (agent-shell-chat--displayed-substring
+                                          (point-min) (point-max))))
+      (let ((scoped (agent-shell-chat-mode-tests--overlay-snapshot)))
+        (agent-shell-chat--relabel)
+        (should (equal scoped (agent-shell-chat-mode-tests--overlay-snapshot)))))))
+
+(ert-deftest agent-shell-chat-schedules-scoped-relabel-test ()
+  "Streaming relabels the last turn; earlier changes relabel the whole buffer."
+  (with-temp-buffer
+    (setq-local agent-shell--state '((:agent-config . ((:mode-line-name . "Claude"))))
+                agent-shell-chat-mode t)
+    (agent-shell-chat-mode-tests--prompt "Claude> ")
+    (insert "first\n")
+    (agent-shell-chat-mode-tests--marker)
+    (insert "one\n\n")
+    (agent-shell-chat-mode-tests--prompt "Claude> ")
+    (let ((agent-shell-prompt-bar-mode nil)
+          (relabeled-from 'unset))
+      (cl-letf (((symbol-function 'agent-shell-subscribe-to) #'ignore)
+                ((symbol-function 'agent-shell-unsubscribe) #'ignore)
+                ((symbol-function 'agent-shell-chat--relabel)
+                 (lambda (&optional from) (setq relabeled-from from))))
+        (agent-shell-chat--enable)
+        (dolist (case `(((:events . (((:event . agent-message-chunk))))
+                         (:scoped . t))
+                        ((:events . (((:event . turn-complete))))
+                         (:scoped . nil))
+                        ((:sections . (((:block . ((:start . ,(1- (point-max))))))))
+                         (:scoped . t))
+                        ((:sections . (((:block . ((:start . 1))))))
+                         (:scoped . nil))
+                        ((:events . (((:event . agent-message-chunk))))
+                         (:sections . (nil))
+                         (:scoped . nil))
+                        ;; Hooks left by an earlier version of chat mode.
+                        ((:old-hooks . (((:event . agent-message-chunk))
+                                     ((:block . ((:start . ,(1- (point-max))))))))
+                         (:scoped . nil))))
+          (seq-do #'agent-shell-chat--relabel-after-event (map-elt case :events))
+          (seq-do #'agent-shell-chat--relabel-after-section (map-elt case :sections))
+          (seq-do #'agent-shell-chat--schedule-relabel (map-elt case :old-hooks))
+          (cancel-timer agent-shell-chat--relabel-timer)
+          (agent-shell-chat--relabel-buffer (current-buffer))
+          (should (equal relabeled-from
+                         (when (map-elt case :scoped)
+                           (agent-shell-chat--last-marker-start)))))
         (agent-shell-chat--disable)))))
 
 (ert-deftest agent-shell-chat-absorbs-leading-blank-lines-test ()

@@ -49,6 +49,33 @@
                       (agent-shell-markdown-convert (car case)))
                      (cadr case))))))
 
+(ert-deftest agent-shell-markdown-convert-emphasis-cjk-friendly ()
+  ;; Punctuation against a delimiter with CJK on the other side, which
+  ;; CommonMark leaves literal (markdown-cjk-friendly, issue #942).
+  (dolist (case '(("**가중치(Weights)**라고"
+                   (("가중치(Weights)" (agent-shell-markdown-bold)) ("라고" nil)))
+                  ("これは**「重要」**です"
+                   (("これは" nil) ("「重要」" (agent-shell-markdown-bold))
+                    ("です" nil)))
+                  ("这是**“重点”**内容"
+                   (("这是" nil) ("“重点”" (agent-shell-markdown-bold))
+                    ("内容" nil)))
+                  ("*가중치(Weights)*라고"
+                   (("가중치(Weights)" (agent-shell-markdown-italic))
+                    ("라고" nil)))))
+    (ert-info ((format "Markdown: %S" (car case)))
+      (should (equal (agent-shell-markdown--deconstruct
+                      (agent-shell-markdown-convert (car case)))
+                     (cadr case))))))
+
+(ert-deftest agent-shell-markdown-convert-emphasis-cjk-friendly-needs-cjk ()
+  ;; The same shapes without CJK stay CommonMark.
+  (dolist (source '("**weights(W)**tail" "**вес(W)**мир" "*weights(W)*tail"))
+    (ert-info ((format "Markdown: %S" source))
+      (should (equal (agent-shell-markdown--deconstruct
+                      (agent-shell-markdown-convert source))
+                     (list (list source nil)))))))
+
 (ert-deftest agent-shell-markdown-convert-bold-delimiter-boundaries ()
   (dolist (source '("word__literal__tail" "** leading**" "**trailing **"
                     "a**\"quoted\"**b" "**unclosed"))
@@ -409,6 +436,24 @@
                  '(("Big" (agent-shell-markdown-header-2 agent-shell-markdown-bold))
                    (" title" (agent-shell-markdown-header-2))
                    ("\n" nil)))))
+
+(ert-deftest agent-shell-markdown-convert-header-flush-against-source-block ()
+  ;; A header with no blank line before a fence keeps its title, and
+  ;; the fence still renders as a panel (issue #947).
+  (dolist (case '(("# H\n```org\nB\n```\n" "H" agent-shell-markdown-header-1)
+                  ("###### H\n```org\nB\n```\n" "H" agent-shell-markdown-header-6)
+                  ("> # H\n```org\nB\n```\n" "> H" agent-shell-markdown-header-1)
+                  ("```sh\nls\n```\n# H\n```org\nB\n```\n" "H"
+                   agent-shell-markdown-header-1)))
+    (ert-info ((format "Markdown: %S" (car case)))
+      (let ((s (agent-shell-markdown-convert (car case))))
+        (should (string-search (concat (nth 1 case) "\n") s))
+        (should (memq (nth 2 case)
+                      (ensure-list (get-text-property (string-search "H" s)
+                                                      'face s))))
+        (should-not (string-search "```" s))
+        (should (get-text-property (string-search "B" s)
+                                   'agent-shell-markdown-source-block-rendered s))))))
 
 (ert-deftest agent-shell-markdown-convert-fenced-block-protects-markup ()
   (should (equal (agent-shell-markdown--deconstruct
@@ -2344,6 +2389,57 @@ raise SystemExit
 
 "))))
 
+(ert-deftest agent-shell-markdown-source-block-adjacent-blocks-no-blank-line ()
+  ;; Regression (#940): the first block's closing `:end' marker and the
+  ;; second block's opening `:start' marker share a position, so the
+  ;; first block's padding must not push the second block's opening
+  ;; fence into its body.
+  (let ((out (agent-shell-markdown-convert
+              "```sh\necho one\n```\n```sh\necho two\n```\n"))
+        (bodies '())
+        (pos 0))
+    (while (setq pos (text-property-not-all
+                      pos (length out)
+                      'agent-shell-markdown-source-block-body nil out))
+      (let ((end (or (next-single-property-change
+                      pos 'agent-shell-markdown-source-block-body out)
+                     (length out))))
+        (push (substring-no-properties out pos end) bodies)
+        (setq pos end)))
+    (should (equal (nreverse bodies) '("echo one" "echo two")))
+    (should-not (string-match-p "```" out))))
+
+(ert-deftest agent-shell-markdown-source-block-adjacent-blocks-framed-apart ()
+  ;; Panels rendered flush against each other gain the same untinted
+  ;; blank line as fences the agent separated, whether both blocks render
+  ;; in one pass or stream in across passes.
+  (let ((framed "
+sh ⧉
+
+echo one
+
+
+
+sh ⧉
+
+echo two
+
+"))
+    (should (equal (substring-no-properties
+                    (agent-shell-markdown-convert
+                     "```sh\necho one\n```\n```sh\necho two\n```\n"))
+                   framed))
+    (should (equal (substring-no-properties
+                    (agent-shell-markdown-convert
+                     "```sh\necho one\n```\n\n```sh\necho two\n```\n"))
+                   framed))
+    (with-temp-buffer
+      (dolist (chunk '("```sh\necho one\n```\n" "```sh\necho two\n```\n"))
+        (goto-char (point-max))
+        (insert chunk)
+        (agent-shell-markdown-replace-markup))
+      (should (equal (substring-no-properties (buffer-string)) framed)))))
+
 (ert-deftest agent-shell-markdown-source-block-body-protected-across-calls ()
   ;; Streaming: render a block, then append more markdown and re-render.
   ;; The previously-rendered body (`agent-shell-markdown-frozen t') must stay
@@ -3820,6 +3916,26 @@ returns (agent-shell-markdown-table agent-shell-markdown-table-zebra)."
                   (ensure-list (get-text-property (match-beginning 0)
                                                   'font-lock-face))))))
 
+(ert-deftest agent-shell-markdown-line-styling-keeps-markup-refontified-while-pending ()
+  ;; Bold styled while its line waits for the newline can be
+  ;; re-fontified before the blockquote or header styling lands on the
+  ;; whole line.  That styling must layer onto the bold, not replace it.
+  (dolist (chunks '(("> a **b** c" "\n")
+                    ("# a **b** c" "\n")))
+    (ert-info ((format "Chunks: %S" chunks))
+      (with-temp-buffer
+        (dolist (chunk chunks)
+          (goto-char (point-max))
+          (insert chunk)
+          (agent-shell-markdown-replace-markup)
+          ;; What re-fontification does to `face' between chunks.
+          (remove-text-properties (point-min) (point-max) '(face nil)))
+        (goto-char (point-min))
+        (search-forward "b ")
+        (should (memq 'agent-shell-markdown-bold
+                      (ensure-list (get-text-property (match-beginning 0)
+                                                      'font-lock-face))))))))
+
 (ert-deftest agent-shell-markdown-table-inside-open-fence-stays-raw ()
   ;; A table inside a fenced block whose closing fence hasn't
   ;; streamed in yet must NOT get table-rendered.  Otherwise the
@@ -4421,15 +4537,124 @@ A " nil)
                                 'face 'agent-shell-markdown-blockquote))))))
 
 (ert-deftest agent-shell-markdown-convert-blockquote-with-bold ()
-  ;; Inline markup inside a blockquote still renders — bold runs
-  ;; before blockquote, and the blockquote face composes on top so
-  ;; the bold text ends up with both faces.
+  ;; Inline markup inside a blockquote still renders.  The blockquote
+  ;; face goes beneath bold, so a theme whose blockquote face sets a
+  ;; regular weight cannot mask the bold.
   (should (equal (agent-shell-markdown--deconstruct
                   (agent-shell-markdown-convert "> hello **world**\n"))
                  '(("> hello " (agent-shell-markdown-blockquote))
-                   ("world" (agent-shell-markdown-blockquote
-                             agent-shell-markdown-bold))
+                   ("world" (agent-shell-markdown-bold
+                             agent-shell-markdown-blockquote))
                    ("\n" nil)))))
+
+(ert-deftest agent-shell-markdown-convert-blockquote-header ()
+  ;; A quoted header drops its `#' but keeps the `>' for the bar, and
+  ;; copies back as the original markdown.
+  (with-temp-buffer
+    (insert "> ## A **bold** title\n")
+    (agent-shell-markdown-replace-markup :force t)
+    (should (equal (agent-shell-markdown--deconstruct (buffer-string))
+                   '(("> " (agent-shell-markdown-blockquote))
+                     ("A " (agent-shell-markdown-header-2
+                            agent-shell-markdown-blockquote))
+                     ("bold" (agent-shell-markdown-header-2
+                              agent-shell-markdown-bold
+                              agent-shell-markdown-blockquote))
+                     (" title" (agent-shell-markdown-header-2
+                                agent-shell-markdown-blockquote))
+                     ("\n" nil))))
+    (should (get-text-property (point-min) 'display))
+    (should (equal (agent-shell-markdown-reconstruct (point-min) (point-max))
+                   "> ## A **bold** title\n"))))
+
+(ert-deftest agent-shell-markdown-convert-blockquote-divider ()
+  ;; A quoted divider draws the rule over `---' only, leaving the `>'
+  ;; to show as the quote's bar.
+  (let ((s (agent-shell-markdown-convert "> ---\n")))
+    (should (equal (substring-no-properties s) "> ---\n"))
+    (should (equal-including-properties
+             (get-text-property 0 'display s)
+             (propertize "▌" 'face 'agent-shell-markdown-blockquote)))
+    (should-not (get-text-property 1 'display s))
+    (should (equal-including-properties
+             (get-text-property 2 'display s)
+             (concat (propertize (make-string 12 ?\s) 'face '(:underline t))
+                     "\n")))
+    (should (eq (next-single-property-change 2 'display s) 5))))
+
+(ert-deftest agent-shell-markdown-convert-blockquote-source-block ()
+  ;; A fenced block inside a quote renders as a panel: the `>' markers
+  ;; leave the body and come back as bars in the panel's `line-prefix'.
+  (let* ((s (agent-shell-markdown-convert "> ```python\n> x = 1\n>     y = 2\n> ```\n"))
+         (body (string-search "x = 1" s)))
+    (should body)
+    (should (string-search "\n    y = 2" s))
+    (should-not (string-search "```" s))
+    (should (string-prefix-p "  ▌ " (get-text-property body 'line-prefix s)))
+    (should (get-text-property body 'agent-shell-markdown-frozen s))))
+
+(ert-deftest agent-shell-markdown-convert-nested-blockquote-source-block ()
+  ;; Each quote level gets its own bar.
+  (let* ((s (agent-shell-markdown-convert "> > ```sh\n> > ls\n> > ```\n"))
+         (body (string-search "ls" s)))
+    (should (string-prefix-p "  ▌ ▌ " (get-text-property body 'line-prefix s)))))
+
+(ert-deftest agent-shell-markdown-blockquote-source-block-gaps-keep-bars ()
+  ;; Framing gaps between the panel and the rest of its quote keep the
+  ;; bars, and copy back as bare `>' lines so the quote stays whole.
+  (with-temp-buffer
+    (insert "> Here:\n> ```sh\n> ls\n> ```\n> after\n")
+    (agent-shell-markdown-replace-markup :force t)
+    (goto-char (point-min))
+    (forward-line 1)
+    (should (looking-at-p "\n"))
+    (should (equal (substring-no-properties (get-text-property (point) 'line-prefix))
+                   "  ▌ "))
+    (should (equal (agent-shell-markdown-reconstruct (point-min) (point-max))
+                   "> Here:\n>\n> ```sh\n> ls\n> ```\n>\n> after\n"))))
+
+(ert-deftest agent-shell-markdown-blockquote-source-block-bare-quote-line-is-gap ()
+  ;; A bare `>' line already separating the panel from its quote
+  ;; counts as the gap, so no second one is inserted.
+  (let ((markdown "> Here:\n>\n> ```sh\n> ls\n> ```\n>\n> after\n"))
+    (with-temp-buffer
+      (insert markdown)
+      (agent-shell-markdown-replace-markup :force t)
+      (goto-char (point-min))
+      (forward-line 1)
+      (should (looking-at-p ">\n"))
+      (forward-line 1)
+      (should (get-text-property (point) 'agent-shell-markdown-source-block-rendered))
+      (should (equal (agent-shell-markdown-reconstruct (point-min) (point-max))
+                     markdown)))))
+
+(ert-deftest agent-shell-markdown-source-block-after-blockquote-has-no-bars ()
+  ;; A top-level fence right after a quote is outside it.
+  (let* ((s (agent-shell-markdown-convert "> quote\n```sh\nls\n```\n"))
+         (gap (1+ (string-search "\n" s))))
+    (should (eq (aref s gap) ?\n))
+    (should-not (get-text-property gap 'line-prefix s))
+    (should-not (string-search "▌" (get-text-property (string-search "ls" s)
+                                                      'line-prefix s)))))
+
+(ert-deftest agent-shell-markdown-blockquote-fence-inside-source-block-is-body ()
+  ;; A quoted fence inside a top-level block is body, and a closing
+  ;; fence at a different quote depth does not close a block.
+  (let ((s (agent-shell-markdown-convert "```markdown\n> ```sh\n> ls\n> ```\n```\n")))
+    (should (string-search "> ```sh\n> ls\n> ```" s)))
+  (let ((blocks (with-temp-buffer
+                  (insert "> ```sh\n> ls\n```\n")
+                  (agent-shell-markdown--source-blocks))))
+    (should (equal (length blocks) 1))
+    (should-not (map-elt (car blocks) :complete))))
+
+(ert-deftest agent-shell-markdown-source-blocks-strips-blockquote-markers-from-body ()
+  ;; External renderers get the code, not the quote markers.
+  (let ((block (car (with-temp-buffer
+                      (insert "> ```math\n> \\frac{a}{b}\n> ```\n")
+                      (agent-shell-markdown--source-blocks)))))
+    (should (equal (map-elt block :body) "\\frac{a}{b}"))
+    (should (equal (map-elt block :blockquote-depth) 1))))
 
 (ert-deftest agent-shell-markdown-blockquote-waits-for-newline-across-chunks ()
   ;; A blockquote line streamed across two chunks (`> hel' then `lo\n')
@@ -4751,6 +4976,101 @@ which is stubbed here so the test exercises only the policy."
     (should-not (agent-shell-markdown--fetch-remote-image "file:///tmp/x.png" "/tmp/img-cache"))
     (should-not (agent-shell-markdown--fetch-remote-image "https://example.com/img?id=1" "/tmp/img-cache"))))
 
+(ert-deftest agent-shell-markdown--local-image-path-test ()
+  "Test `agent-shell-markdown--local-image-path'.
+
+Local paths pass through untouched.  A remote path is copied into the
+cache once per modification time; with no cache, or a failed copy, it
+yields nil."
+  (let ((cache (make-temp-file "agent-shell-image-cache" t))
+        (mtime '(26000 0))
+        (copies 0))
+    (unwind-protect
+        (progn
+          ;; Local: returned as is, nothing copied.
+          (cl-letf (((symbol-function 'copy-file)
+                     (lambda (&rest _) (error "Should not copy"))))
+            (should (equal (agent-shell-markdown--local-image-path
+                            :path "/tmp/a.png" :image-cache-directory cache)
+                           "/tmp/a.png")))
+          (cl-letf (((symbol-function 'file-remote-p) (lambda (&rest _) t))
+                    ((symbol-function 'file-attributes)
+                     (lambda (&rest _)
+                       (list nil 1 0 0 nil mtime nil 0 "-rw-r--r--" t 0 0)))
+                    ((symbol-function 'copy-file)
+                     (lambda (_from to &rest _)
+                       (setq copies (1+ copies))
+                       (with-temp-file to (insert "png")))))
+            ;; Remote: copied into the cache, keeping its extension.
+            (let ((first (agent-shell-markdown--local-image-path
+                          :path "/ssh:host:/tmp/a.png" :image-cache-directory cache)))
+              (should (string-prefix-p (file-name-as-directory cache) first))
+              (should (string-suffix-p ".png" first))
+              (should (file-exists-p first))
+              ;; Rendering again reuses the copy.
+              (should (equal (agent-shell-markdown--local-image-path
+                              :path "/ssh:host:/tmp/a.png" :image-cache-directory cache)
+                             first))
+              (should (= copies 1))
+              ;; An edited image is copied afresh.
+              (setq mtime '(26000 1))
+              (should-not (equal (agent-shell-markdown--local-image-path
+                                  :path "/ssh:host:/tmp/a.png" :image-cache-directory cache)
+                                 first))
+              (should (= copies 2)))
+            ;; No cache: remote images are not copied.
+            (should-not (agent-shell-markdown--local-image-path
+                         :path "/ssh:host:/tmp/b.png" :image-cache-directory nil))
+            (should (= copies 2)))
+          ;; A failed copy yields nil rather than signaling.
+          (cl-letf (((symbol-function 'file-remote-p) (lambda (&rest _) t))
+                    ((symbol-function 'file-attributes)
+                     (lambda (&rest _)
+                       (list nil 1 0 0 nil mtime nil 0 "-rw-r--r--" t 0 0)))
+                    ((symbol-function 'copy-file)
+                     (lambda (&rest _) (error "Connection lost"))))
+            (should-not (agent-shell-markdown--local-image-path
+                         :path "/ssh:host:/tmp/c.png" :image-cache-directory cache))))
+      (delete-directory cache t))))
+
+(ert-deftest agent-shell-markdown-remote-image-renders-local-copy-test ()
+  "Test remote images display their local copy yet open the remote file.
+
+Covers both `![alt](path)' markup and bare image-path lines, and that
+the cache directory reaches `agent-shell-markdown--local-image-path'."
+  (dolist (markdown '("![remote](/ssh:host:/tmp/a.png)\n"
+                      "/ssh:host:/tmp/a.png\n"))
+    (let ((loaded nil)
+          (visited nil)
+          (cache-directories nil))
+      (cl-letf (((symbol-function 'display-graphic-p) (lambda (&optional _d) t))
+                ((symbol-function 'image-supported-file-p) (lambda (_f) t))
+                ((symbol-function 'agent-shell-markdown--resolve-image-url)
+                 (lambda (url &rest _) url))
+                ((symbol-function 'agent-shell-markdown--local-image-path)
+                 (cl-function
+                  (lambda (&key image-cache-directory &allow-other-keys)
+                    (push image-cache-directory cache-directories)
+                    "/cache/copy.png")))
+                ((symbol-function 'create-image)
+                 (lambda (file &rest _)
+                   (setq loaded file)
+                   '(image :type png :fake t)))
+                ((symbol-function 'image-flush) (lambda (&rest _) nil))
+                ((symbol-function 'agent-shell-markdown-visit-file)
+                 (cl-function (lambda (&key file &allow-other-keys)
+                                (setq visited file)))))
+        (with-temp-buffer
+          (insert markdown)
+          (agent-shell-markdown-replace-markup :render-images t
+                                               :image-cache-directory "/cache")
+          (should (equal loaded "/cache/copy.png"))
+          (should (equal cache-directories '("/cache")))
+          (let ((pos (text-property-not-all (point-min) (point-max) 'display nil)))
+            (should pos)
+            (funcall (lookup-key (get-text-property pos 'keymap) (kbd "RET"))))
+          (should (equal visited "/ssh:host:/tmp/a.png")))))))
+
 (ert-deftest agent-shell-markdown--resolve-image-url-bare-relative-test ()
   "Test `agent-shell-markdown--resolve-image-url' gates bare relative paths.
 
@@ -4775,6 +5095,34 @@ common than an image meant to render."
             (should-not (agent-shell-markdown--resolve-image-url
                          "data:image/png;base64,AAAA" :allow-bare-relative t))))
       (delete-directory directory t))))
+
+(ert-deftest agent-shell-markdown--resolve-image-url-tramp-test ()
+  "Test `agent-shell-markdown--resolve-image-url' never opens a connection.
+
+A path on a host with no open connection stays nil without being
+looked up, since a lookup would connect.  An open connection resolves
+the path, and a lookup that signals (the connection dropped) gives nil."
+  (let ((connected nil)
+        (looked-up nil)
+        (exists t))
+    (cl-letf (((symbol-function 'file-remote-p)
+               (lambda (file &optional _identification connected-only)
+                 (and (string-prefix-p "/ssh:" file)
+                      (or (not connected-only) connected)
+                      "/ssh:host:")))
+              ((symbol-function 'file-exists-p)
+               (lambda (_file)
+                 (setq looked-up t)
+                 (if (eq exists 'signal)
+                     (signal 'remote-file-error '("Tramp failed to connect"))
+                   exists))))
+      (should-not (agent-shell-markdown--resolve-image-url "/ssh:host:/tmp/a.png"))
+      (should-not looked-up)
+      (setq connected t)
+      (should (equal (agent-shell-markdown--resolve-image-url "/ssh:host:/tmp/a.png")
+                     "/ssh:host:/tmp/a.png"))
+      (setq exists 'signal)
+      (should-not (agent-shell-markdown--resolve-image-url "/ssh:host:/tmp/a.png")))))
 
 (ert-deftest agent-shell-markdown--resolve-image-url-remote-test ()
   "Test that `agent-shell-markdown--resolve-image-url' fetches http(s) urls.
@@ -5408,6 +5756,98 @@ for a fully-selected buffer."
     (goto-char (1+ (point-min)))
     (should (equal (agent-shell-markdown-link-url-at-point)
                    "https://example.com"))))
+
+;;; Navigating and copying rendered blockquotes.
+
+(ert-deftest agent-shell-markdown-blockquote-at-point-copies-markup ()
+  ;; The quote copies as its markdown, without its own `>' markers.
+  ;; A nested quote keeps its markers, a code block its fences.
+  (with-temp-buffer
+    (insert "Intro
+
+> Use **this**:
+>
+> ```sh
+> ls
+> ```
+>
+> > nested
+
+After
+")
+    (agent-shell-markdown-replace-markup :force t)
+    (goto-char (point-min))
+    (dolist (text '("Use" "ls" "nested"))
+      (search-forward text)
+      (should (equal (agent-shell-markdown-blockquote-at-point (1- (point)))
+                     "Use **this**:
+
+```sh
+ls
+```
+
+> nested")))
+    (search-forward "After")
+    (should-not (agent-shell-markdown-blockquote-at-point (1- (point))))))
+
+(ert-deftest agent-shell-markdown-blockquote-binds-ret-to-copy ()
+  ;; RET anywhere in the quote copies it, except where something in it
+  ;; binds keys of its own: a link opens, a code block's label copies
+  ;; the code.
+  (with-temp-buffer
+    (insert "> see [docs](https://docs.com/x)
+> ```sh
+> ls
+> ```
+")
+    (agent-shell-markdown-replace-markup :force t)
+    (goto-char (point-min))
+    (should (eq (get-text-property (point) 'keymap)
+                agent-shell-markdown--blockquote-map))
+    (search-forward "docs")
+    (should-not (eq (get-text-property (1- (point)) 'keymap)
+                    agent-shell-markdown--blockquote-map))
+    (search-forward "⧉")
+    (should-not (eq (get-text-property (1- (point)) 'keymap)
+                    agent-shell-markdown--blockquote-map))
+    (search-forward "ls")
+    (should (eq (get-text-property (1- (point)) 'keymap)
+                agent-shell-markdown--blockquote-map))))
+
+(ert-deftest agent-shell-markdown-blockquote-ends-at-its-last-line ()
+  ;; A gap framing a code block after the quote is not part of it.
+  (with-temp-buffer
+    (insert "> quote
+```sh
+ls
+```
+")
+    (agent-shell-markdown-replace-markup :force t)
+    (should (equal (agent-shell-markdown--blockquote-range (point-min))
+                   `((:start . ,(point-min))
+                     (:end . ,(+ (point-min) (length "> quote\n"))))))))
+
+(ert-deftest agent-shell-markdown-next-visible-blockquote ()
+  ;; Navigation lands past the bars, on the quote's text, then moves on
+  ;; to the next quote.
+  (with-temp-buffer
+    (insert "Intro
+
+>> first
+
+middle
+
+> second
+")
+    (agent-shell-markdown-replace-markup :force t)
+    (goto-char (point-min))
+    (goto-char (agent-shell-markdown--next-visible-blockquote))
+    (should (looking-at-p "first"))
+    (goto-char (agent-shell-markdown--next-visible-blockquote))
+    (should (looking-at-p "second"))
+    (should-not (agent-shell-markdown--next-visible-blockquote))
+    (goto-char (agent-shell-markdown--previous-visible-blockquote))
+    (should (looking-at-p "first"))))
 
 ;;; Exposing rendered code block bodies at point.
 
