@@ -20,9 +20,16 @@ This is an Emacs Lisp project. See [CONTRIBUTING.org](CONTRIBUTING.org) for styl
 
 ## Форк demoj1
 
-Личный форк, Emacs грузит agent-shell отсюда. Remotes: `origin` — `demoj1/agent-shell`, `upstream` — `xenodium/agent-shell`.
+Личный форк (`~/:pet/language/elisp/agent-shell`), Emacs грузит `agent-shell` отсюда через `:load-path`. Remotes: `origin` — `demoj1/agent-shell`, `upstream` — `xenodium/agent-shell`.
 
+Что поддерживается в форке поверх апстрима:
+- `agent-shell-turn-time.el` — время и длительность ходов на бейджах чата.
+- `agent-shell-claude-status.el` — `post_turn_summary` оверлеем под ответом (без дубля в конце ответа), `task_summary` справа на метке, `bridge_state`/rate-limit в header, `prompt_suggestion` (Tab), колонка ibuffer `agent-status`, фильтр Notices (`agent-shell-claude-status-ignored-stderr-regexps`), `agent-shell-reload-idle`.
+- `agent-shell-easysession.el` (+ `tests/agent-shell-easysession-tests.el`) и `agent-shell-unload` — ленивое восстановление сессий через EasySession и выгрузка без потери истории.
+- Точечные правки в `agent-shell.el`, `agent-shell-anthropic.el`, `agent-shell-chat-mode.el`: короткий session ID (8 символов) с копированием кликом, подхват свежего конфига по `:identifier` при `agent-shell-restart`, синк `shell-maker--buffer-name-override` при переименовании буфера, проброс уведомлений и фреймов статуса.
+
+Правила ведения форка и синка:
 - Свои правки — коммитами в `main` форка, каждая отдельным коммитом с понятным заголовком, чтобы их было видно в `git log upstream/main..main`.
-- Апстрим подтягивать иногда (раз в неделю-две или когда юзер попросит): `git fetch upstream && git merge upstream/main`. Merge, не rebase: ребейз переписывает уже запушенный `main` форка.
-- При конфликтах сохранять обе стороны: поведение апстрима плюс наши правки поверх. После мержа проверить, что наши правки живы (`git log upstream/main..main`), и собрать: `make` / byte-compile по CONTRIBUTING.org.
-- Push в `origin` и PR в апстрим — только по явному «го» юзера. Текст PR и issue для xenodium пишет сам юзер (см. Communication norms выше).
+- Апстрим подтягивать периодически (раз в 1–2 недели или по запросу): `git fetch upstream && git merge upstream/main`. Merge, не rebase: ребейз переписывает уже запушенный `main` форка.
+- При конфликтах сохранять обе стороны: поведение апстрима плюс наши правки поверх. После мержа проверить, что наши правки живы (`git log upstream/main..main`), и прогнать проверки/сборку по [CONTRIBUTING.org](CONTRIBUTING.org).
+- **Обязательно обновлять форк на GitHub:** после синка или новых правок делать `git push origin main` (PR и issue в `upstream` `xenodium/agent-shell` — только по явному «го» пользователя и его текстом, см. Communication norms выше).
